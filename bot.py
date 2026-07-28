@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import http.server
 import json
 import logging
 import os
 import random
+import socketserver
 import sys
+import threading
 import time
 from typing import Dict, List, Any, Optional, Set
 
@@ -32,6 +35,32 @@ logging.basicConfig(
 logger = logging.getLogger("ChannelCopier")
 
 START_TIME = time.time()
+
+
+def start_dummy_web_server():
+    """Start a lightweight HTTP server on PORT for Render's 100% Free Web Service tier."""
+    port = int(os.getenv("PORT", "8080"))
+
+    class HealthHandler(http.server.SimpleHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Iconic Impact Tutor Bot is running live!")
+
+        def log_message(self, format, *args):
+            pass  # Suppress HTTP access logs
+
+    def run_server():
+        try:
+            with socketserver.TCPServer(("", port), HealthHandler) as httpd:
+                logger.info(f"🌐 Health check web server active on port {port} for Render Free Tier.")
+                httpd.serve_forever()
+        except Exception as e:
+            logger.warning(f"Dummy web server info: {e}")
+
+    thread = threading.Thread(target=run_server, daemon=True)
+    thread.start()
 
 
 def parse_iso_datetime(dt_str: str) -> datetime.datetime:
@@ -789,6 +818,8 @@ class TelegramCopierBot:
 
     async def post_init(self, application) -> None:
         """Start worker loops, scheduler, and register bot commands menu."""
+        start_dummy_web_server()
+
         commands = [
             BotCommand("start", "Welcome message & quick menu"),
             BotCommand("pairs", "View subjects, spacing & AI status"),
