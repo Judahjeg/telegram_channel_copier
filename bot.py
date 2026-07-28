@@ -1382,6 +1382,47 @@ class TelegramCopierBot:
         clean_text = re.sub(r'<ACTION>.*?</ACTION>', '', ai_reply, flags=re.DOTALL).strip()
         await message.reply_text(clean_text, parse_mode="HTML")
 
+    async def _ingest_migration_ref(self, user_id: int, chat_id: int, title: str, msg_id: int) -> str:
+        """Shared state machine behind both forwarding and pasting a 'Copy Message Link':
+        collects (source start, source end, destination) one message at a time and reports
+        back what to send next, ending in a ready-to-confirm /backfill."""
+        refs = self.pending_migration_refs.setdefault(user_id, {})
+
+        if "source" not in refs:
+            refs["source"] = {"chat_id": chat_id, "title": title}
+            refs["start_id"] = msg_id
+            return (
+                f"📌 Got it — <b>{title}</b> (<code>{chat_id}</code>), starting from message #{msg_id}.\n\n"
+                f"Now send me the LAST message you want migrated from this same old channel "
+                f"(forward it, or paste its 'Copy Message Link')."
+            )
+
+        if chat_id == refs["source"]["chat_id"] and "end_id" not in refs:
+            refs["end_id"] = msg_id
+            return (
+                f"📌 Got the end point — message #{msg_id}.\n\n"
+                f"Now send me any message from the NEW channel you want this copied into."
+            )
+
+        if "dest" not in refs:
+            refs["dest"] = {"chat_id": chat_id, "title": title}
+            refs["ready"] = True
+            start = refs["start_id"]
+            end = refs.get("end_id", start)
+            return (
+                f"✅ <b>Got everything I need!</b>\n\n"
+                f"📤 FROM: <b>{refs['source']['title']}</b> (<code>{refs['source']['chat_id']}</code>)\n"
+                f"📥 TO: <b>{title}</b> (<code>{chat_id}</code>)\n"
+                f"Range: messages #{start}–{end}\n\n"
+                f"Reply <b>yes</b> to start migrating, or send a different message to start over."
+            )
+
+        self.pending_migration_refs[user_id] = {"source": {"chat_id": chat_id, "title": title}, "start_id": msg_id}
+        return (
+            f"🔄 Starting a fresh migration reference: <b>{title}</b>, message #{msg_id}. "
+            f"Send the LAST message from this channel next."
+        )
+
     async def handle_forwarded_reference(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -1395,50 +1436,56 @@ class TelegramCopierBot:
         if not isinstance(origin, MessageOriginChannel):
             await message.reply_text(
                 "🤔 I can read forwards from channels, but couldn't find the original channel/message "
-                "on this one (maybe it's not from a channel, or the channel hides forward info). "
-                "Try forwarding an actual post from the channel, or just tell me the channel's ID directly."
+                "on this one (maybe it's not from a channel, or the channel hides forward info). Try "
+                "forwarding an actual post from the channel, or paste its 'Copy Message Link' instead."
             )
             return
 
-        fchat = origin.chat
-        fmsg_id = origin.message_id
-        refs = self.pending_migration_refs.setdefault(user.id, {})
+        reply = await self._ingest_migration_ref(user.id, origin.chat.id, origin.chat.title, origin.message_id)
+        await message.reply_text(reply, parse_mode="HTML")
 
-        if "source" not in refs:
-            refs["source"] = {"chat_id": fchat.id, "title": fchat.title}
-            refs["start_id"] = fmsg_id
-            await message.reply_text(
-                f"📌 Got it — <b>{fchat.title}</b> (<code>{fchat.id}</code>), starting from message #{fmsg_id}.\n\n"
-                f"Now forward me the LAST message you want migrated from this same old channel.",
-                parse_mode="HTML",
-            )
-        elif fchat.id == refs["source"]["chat_id"] and "end_id" not in refs:
-            refs["end_id"] = fmsg_id
-            await message.reply_text(
-                f"📌 Got the end point — message #{fmsg_id}.\n\n"
-                f"Now forward me any message from the NEW channel you want this copied into.",
-                parse_mode="HTML",
-            )
-        elif "dest" not in refs:
-            refs["dest"] = {"chat_id": fchat.id, "title": fchat.title}
-            refs["ready"] = True
-            start = refs["start_id"]
-            end = refs.get("end_id", start)
-            await message.reply_text(
-                f"✅ <b>Got everything I need!</b>\n\n"
-                f"📤 FROM: <b>{refs['source']['title']}</b> (<code>{refs['source']['chat_id']}</code>)\n"
-                f"📥 TO: <b>{fchat.title}</b> (<code>{fchat.id}</code>)\n"
-                f"Range: messages #{start}–{end}\n\n"
-                f"Reply <b>yes</b> to start migrating, or forward a different message to start over.",
-                parse_mode="HTML",
-            )
+    TG_MESSAGE_LINK_RE = re.compile(
+        r"(?:https?://)?t\.me/(?:c/(?P<internal_id>\d+)|(?P<username>[A-Za-z0-9_]{5,32}))/(?P<msg_id>\d+)"
+    )
+
+    async def handle_message_link_text(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> bool:
+        """Parses a pasted 'Copy Message Link' (e.g. https://t.me/c/1234567890/1500) directly -
+        the simplest option, since long-press -> Copy Message Link is something people already
+        know how to do, and the link alone already carries both the channel and message ID.
+        Returns True if the text was a message link and has been handled."""
+        message = update.effective_message
+        user = update.effective_user
+        match = self.TG_MESSAGE_LINK_RE.search(message.text or "")
+        if not match:
+            return False
+
+        msg_id = int(match.group("msg_id"))
+        if match.group("internal_id"):
+            chat_id = int(f"-100{match.group('internal_id')}")
+            title = str(chat_id)
+            try:
+                chat = await context.bot.get_chat(chat_id)
+                if chat and chat.title:
+                    title = chat.title
+            except Exception:
+                pass
         else:
-            self.pending_migration_refs[user.id] = {"source": {"chat_id": fchat.id, "title": fchat.title}, "start_id": fmsg_id}
-            await message.reply_text(
-                f"🔄 Starting a fresh migration reference: <b>{fchat.title}</b>, message #{fmsg_id}. "
-                f"Forward the LAST message from this channel next.",
-                parse_mode="HTML",
-            )
+            username = match.group("username")
+            try:
+                chat = await context.bot.get_chat(f"@{username}")
+                chat_id = chat.id
+                title = chat.title or username
+            except Exception as e:
+                await message.reply_text(
+                    f"❌ Couldn't look up @{username} - make sure the bot is added to that channel as an admin. ({e})"
+                )
+                return True
+
+        reply = await self._ingest_migration_ref(user.id, chat_id, title, msg_id)
+        await message.reply_text(reply, parse_mode="HTML")
+        return True
 
     async def handle_incoming_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1461,6 +1508,10 @@ class TelegramCopierBot:
 
         if chat.type == "private" and message.text and not message.text.startswith("/"):
             user_id = user.id if user else 0
+
+            if await self.handle_message_link_text(update, context):
+                return
+
             refs = self.pending_migration_refs.get(user_id)
             if refs and refs.get("ready") and message.text.strip().lower() in ("yes", "y", "confirm", "go", "start", "yes please"):
                 context.args = [
@@ -1560,38 +1611,22 @@ class TelegramCopierBot:
         locations_block = "\n\n".join(channel_locations) if channel_locations else "<i>No class pairs connected yet. Use /addclass to add your first explicit pair!</i>"
 
         msg = (
-            f"🧙‍♂️ <b>Welcome to Iconic Impact Tutor AI Co-Pilot, {user.first_name if user else 'User'}!</b>\n\n"
-            f"Your Telegram User ID: <code>{user.id if user else 'Unknown'}</code> (🟢 Authorized Admin)\n\n"
-            "✨ <b>Explicit Pair Setup Active!</b> Configure explicit pairs showing exactly FROM which source channel TO which destination channel content flows.\n\n"
-            f"📍 <b>Explicit Connected Channel Pairs:</b>\n"
+            f"🧙‍♂️ <b>Welcome, {user.first_name if user else 'User'}!</b>\n\n"
+            f"📍 <b>Your Connected Channel Pairs:</b>\n"
             f"{locations_block}\n\n"
-            f"📊 <b>Bot Overview:</b>\n"
-            f"• <b>Total Connected Pairs:</b> {len(self.pairs)}\n"
-            f"• 🟢 <b>Active Right Now:</b> {active_count}\n"
-            f"• ⚡ <b>24/7 Keep-Alive Engine:</b> 🟢 Active (Always Awake)\n"
-            f"• 🛠️ <b>Explicit Pair Setup:</b> 🟢 Active (`/addclass` & `/deleteclass`)\n"
-            f"• 💬 <b>Conversational AI Co-Pilot:</b> 🟢 Active\n"
-            f"• 📜 <b>Student Interaction Logs:</b> 🟢 Active (`/logs`)\n"
-            f"• 🤖 <b>AI Engine:</b> {has_ai}\n\n"
-            "💬 <b>Chat with me naturally or run commands:</b>\n"
-            "• <code>/addclass ClassName SourceChatID DestinationChatID</code>\n"
-            "• <i>'Add a class called Further Maths from source -100123 to dest -100456'</i>\n"
-            "• <code>/pairs</code> (View explicit FROM ➔ TO flow)\n\n"
-            "👇 <b>Quick Commands Menu:</b>\n"
-            "• /addclass - Add an explicit FROM ➔ TO channel pair\n"
-            "• /backfill - Migrate previously posted materials from an old channel\n"
-            "• /userbotlogin - Connect your account to read old channels' real history & timing\n"
-            "• /mychannels, /analyzechannel, /previewtiming, /timedbackfill - Test & replay old classes with their real pacing\n"
-            "• /pairs - View explicit FROM ➔ TO channel pair flows\n"
-            "• /deleteclass - Delete a channel pair\n"
-            "• /clearallclasses - Wipe all channel pairs\n"
-            "• /logs - View recent student Q&A interaction logs\n"
-            "• /schedule - View & manage weekly class timetables\n"
-            "• /quiz - Generate interactive quiz for a class\n"
-            "• /summary - Generate weekly master study guide\n"
-            "• /prompt - Set custom AI instructions\n"
-            "• /setdelay - Dictate message spacing\n"
-            "• /activate - Toggle class active state\n"
+            f"<b>Total pairs:</b> {len(self.pairs)} | <b>Active now:</b> {active_count} | <b>AI:</b> {has_ai}\n\n"
+            "📦 <b>To bring over an old channel's materials — the easy way:</b>\n"
+            "1. In the OLD channel, long-press the FIRST message you want migrated → <b>Copy Message "
+            "Link</b> → paste that link to me right here.\n"
+            "2. Do the same for the LAST message you want migrated.\n"
+            "3. Send me one message/link from the NEW channel.\n"
+            "4. I'll show you what I understood — reply <b>yes</b> and I'll run it.\n\n"
+            "That's it — no chat IDs to look up, no setup required first.\n\n"
+            "💬 Or just tell me what you want in plain English, e.g. <i>\"add a class called Further "
+            "Maths from source -100123 to dest -100456\"</i>.\n\n"
+            "👇 <b>A few useful commands</b> (send /help for the full list):\n"
+            "• /pairs - View your channel pairs\n"
+            "• /addclass - Manually register a channel pair by ID\n"
             "• /status - System dashboard\n"
         )
         await update.message.reply_text(msg, parse_mode="HTML")
@@ -1785,10 +1820,16 @@ class TelegramCopierBot:
             "Tell the AI in chat or use <code>/addclass ClassName source_id dest_id [discussion_id]</code>\n\n"
             "<b>2. View Explicit Pair Flows (FROM ➔ TO):</b>\n"
             "Use <code>/pairs</code> or <code>/start</code>\n\n"
-            "<b>2b. Migrate Previously Posted Materials:</b>\n"
-            "New pairs only copy messages posted while the bot is running. To bring over materials "
-            "already sitting in an old channel, use <code>/backfill ClassName start_id end_id</code>.\n\n"
-            "<b>2c. Replay Old Classes With Their Real Timing:</b>\n"
+            "<b>2b. Migrate Previously Posted Materials (easiest way):</b>\n"
+            "New pairs only copy messages posted while the bot is running, so bringing over an old "
+            "channel's materials takes one extra step. In the OLD channel, long-press the FIRST message "
+            "you want migrated → <b>Copy Message Link</b> → paste that link to me here (or just forward "
+            "the message instead, works the same). Do the same for the LAST message, then one message "
+            "from the NEW channel. I'll show you what I understood — reply <b>yes</b> to run it. No IDs "
+            "to type, no /addclass needed.\n\n"
+            "<i>(Prefer typing exact numbers? <code>/backfill source_id dest_id start_id end_id</code> "
+            "works too, or <code>/backfill ClassName start_id end_id</code> for an already-registered class.)</i>\n\n"
+            "<b>2c. Replay Old Classes With Their Real Timing (advanced):</b>\n"
             "1. <code>/userbotlogin +yourphone</code> then open the web link it gives you to enter the "
             "code (never type the code into Telegram itself - it gets auto-blocked). One-time, needs "
             "TELEGRAM_API_ID/TELEGRAM_API_HASH set on the server.\n"

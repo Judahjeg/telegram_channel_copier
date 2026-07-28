@@ -17,6 +17,26 @@ A production-ready Telegram bot written in Python using `python-telegram-bot` (v
 
 ---
 
+## 📦 Bringing Over an Old Channel's Materials (Easiest Way)
+
+New channel pairs only copy messages posted while the bot is running — they can't reach back
+into a channel's history automatically. To bring over materials already sitting in an old
+channel, no chat IDs, no setup, no terminal:
+
+1. In the **OLD channel**, long-press the **first** message you want migrated → **Copy Message
+   Link** → paste that link to the bot in a private chat (forwarding the message instead works
+   identically).
+2. Do the same for the **last** message you want migrated.
+3. Send the bot one message/link from the **NEW channel**.
+4. The bot replies with what it understood — reply **yes** and it runs the migration itself.
+
+That's the whole thing. Repeat those four steps for each channel you need to migrate. Prefer
+typing exact numbers instead? `/backfill source_id dest_id start_id end_id` does the same thing
+directly, or `/backfill ClassName start_id end_id` if you've already registered the class via
+`/addclass`.
+
+---
+
 ## 🤖 Easy Telegram Commands (No Coding Required!)
 
 Once your bot is running, open a chat with your bot in Telegram to use these commands:
