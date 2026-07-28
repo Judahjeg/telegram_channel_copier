@@ -459,9 +459,18 @@ class TelegramCopierBot:
             except Exception as e:
                 logger.error(f"Error executing AI action ACTIVATE: {e}")
 
+        elif "ACTION:QUIZ|" in ai_reply:
+            try:
+                c_name = ai_reply.split("ACTION:QUIZ|")[1].split("\n")[0].strip()
+                target_pair = self.find_pair_by_name(c_name)
+                if target_pair:
+                    await self.post_class_quiz(target_pair, context)
+            except Exception as e:
+                logger.error(f"Error executing AI action QUIZ: {e}")
+
         # Clean raw action codes before sending text to user
         clean_response = ai_reply
-        for prefix in ("ACTION:SETDELAY|", "ACTION:PROMPT|", "ACTION:ACTIVATE|", "ACTION:HELP"):
+        for prefix in ("ACTION:SETDELAY|", "ACTION:PROMPT|", "ACTION:ACTIVATE|", "ACTION:QUIZ|", "ACTION:SUMMARY|", "ACTION:HELP"):
             if prefix in clean_response:
                 clean_response = clean_response.split(prefix)[0] + "\n" + clean_response.split(prefix)[1].split("\n", 1)[-1]
 
@@ -533,41 +542,127 @@ class TelegramCopierBot:
                 )
 
     # ------------------------------------------------------------------
-    # User-Friendly Interactive Commands
+    # User-Friendly Interactive Commands & Setup Wizard
     # ------------------------------------------------------------------
 
     async def start_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Welcome message and user ID info."""
+        """Welcome message and interactive AI Setup Wizard."""
         user = update.effective_user
         active_count = sum(1 for p in self.pairs if p.is_active)
-        dormant_count = len(self.pairs) - active_count
-        has_ai = "🟢 Active (Free Google Gemini API)" if os.getenv("GEMINI_API_KEY") else "⚪ Disabled"
+        has_ai = "🟢 Active (Gemini / DeepSeek API)" if (os.getenv("GEMINI_API_KEY") or os.getenv("DEEPSEEK_API_KEY")) else "⚪ Disabled"
 
         msg = (
-            f"🤖 <b>Welcome, {user.first_name if user else 'User'}!</b>\n\n"
-            f"Your Telegram User ID is: <code>{user.id if user else 'Unknown'}</code>\n\n"
-            "I am your Conversational Bot Manager & Channel Copier! You can chat with me in natural English to configure settings, change prompts, or ask questions.\n\n"
-            f"📊 <b>Overview:</b>\n"
+            f"🧙‍♂️ <b>Welcome to Iconic Impact Tutor Setup Wizard, {user.first_name if user else 'User'}!</b>\n\n"
+            f"Your Telegram User ID: <code>{user.id if user else 'Unknown'}</code>\n\n"
+            "I am your Intelligent AI Manager & Class Assistant! I can help you set up your classes, customize prompts, dictates message spacing, or post practice quizzes.\n\n"
+            f"📊 <b>Current Setup:</b>\n"
             f"• <b>Total Class Channels:</b> {len(self.pairs)}\n"
             f"• 🟢 <b>Active Classes:</b> {active_count}\n"
-            f"• ⏳ <b>Dormant Classes:</b> {dormant_count}\n"
-            f"• 🎓 <b>Discussion Q&A AI:</b> 🟢 Active\n"
-            f"• 💬 <b>Conversational Manager AI:</b> 🟢 Active\n\n"
-            "💬 <b>Try chatting with me!</b>\n"
-            "• <i>'Set Chemistry 1 spacing to 3 minutes'</i>\n"
-            "• <i>'Make Biology 1 posts short with emojis'</i>\n"
-            "• <i>'Pause Physics class for today'</i>\n\n"
-            "👇 <b>Or use quick commands:</b>\n"
-            "• /pairs - View all exact classes & status\n"
-            "• /prompt - Set custom AI instructions per class\n"
+            f"• 🧠 <b>Interactive Quizzes:</b> 🟢 Active (`/quiz`)\n"
+            f"• 📖 <b>Weekly Study Guides:</b> 🟢 Active (`/summary`)\n"
+            f"• 🤖 <b>AI Engine:</b> {has_ai}\n\n"
+            "💬 <b>Chat with me in plain English!</b>\n"
+            "• <i>'How do I set up my classes?'</i>\n"
+            "• <i>'Set Chemistry 1 delay to 3 minutes'</i>\n"
+            "• <i>'Generate a practice quiz for Chemistry 1'</i>\n"
+            "• <i>'Make Biology 1 posts short with study tips'</i>\n\n"
+            "👇 <b>Quick Commands Menu:</b>\n"
+            "• /quiz - Generate interactive quiz for a class\n"
+            "• /summary - Generate weekly master study guide\n"
+            "• /pairs - View exact classes & spacing\n"
+            "• /prompt - Set custom AI instructions\n"
             "• /setdelay - Dictate message spacing\n"
             "• /schedule - View weekly class timetable\n"
             "• /activate - Toggle class active state\n"
-            "• /status - View system status\n"
+            "• /status - System dashboard\n"
         )
         await update.message.reply_text(msg, parse_mode="HTML")
+
+    async def post_class_quiz(self, pair: ChannelPair, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        """Helper to generate and post a Telegram native quiz into the destination chat."""
+        notes = db.get_recent_class_context(pair.name, limit=6)
+        quiz_data = ai_enhancer.generate_class_quiz(pair.name, notes)
+
+        if quiz_data:
+            try:
+                await context.bot.send_poll(
+                    chat_id=pair.destination_chat_id,
+                    question=f"🧠 [{pair.name} Practice Quiz] {quiz_data['question'][:250]}",
+                    options=quiz_data["options"][:10],
+                    type="quiz",
+                    correct_option_id=quiz_data.get("correct_option_id", 0),
+                    explanation=quiz_data.get("explanation", "")[:200],
+                    is_anonymous=False,
+                )
+                logger.info(f"Posted interactive practice quiz to {pair.name}")
+                return True
+            except Exception as e:
+                logger.error(f"Error posting poll quiz to {pair.name}: {e}")
+
+        return False
+
+    async def quiz_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Generate and post an interactive practice quiz for a class."""
+        user = update.effective_user
+        if user and not self.is_user_admin(user.id):
+            await update.message.reply_text("⛔ <b>Access Denied:</b> Only authorized bot admins can generate practice quizzes.", parse_mode="HTML")
+            return
+
+        args = context.args
+        if not args:
+            await update.message.reply_text(
+                "ℹ️ <b>How to generate a Practice Quiz:</b>\n\n"
+                "<code>/quiz ClassName</code>\n"
+                "Example: <code>/quiz Chemistry 1</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        search_query = " ".join(args).strip()
+        found_pair = self.find_pair_by_name(search_query)
+
+        if not found_pair:
+            await update.message.reply_text(f"❌ Class '<b>{search_query}</b>' not found.", parse_mode="HTML")
+            return
+
+        await update.message.reply_text(f"🧠 Generating AI practice quiz for <b>{found_pair.name}</b>...", parse_mode="HTML")
+        success = await self.post_class_quiz(found_pair, context)
+
+        if success:
+            await update.message.reply_text(f"🎉 <b>Success!</b> Interactive practice quiz posted to <b>{found_pair.name}</b> channel!", parse_mode="HTML")
+        else:
+            await update.message.reply_text("❌ Failed to generate quiz. Make sure class lesson notes are recorded.", parse_mode="HTML")
+
+    async def summary_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Generate a Weekly Master Study Guide for exam review."""
+        args = context.args
+        if not args:
+            await update.message.reply_text(
+                "ℹ️ <b>How to generate a Weekly Master Study Guide:</b>\n\n"
+                "<code>/summary ClassName</code>\n"
+                "Example: <code>/summary Chemistry 1</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        search_query = " ".join(args).strip()
+        found_pair = self.find_pair_by_name(search_query)
+
+        if not found_pair:
+            await update.message.reply_text(f"❌ Class '<b>{search_query}</b>' not found.", parse_mode="HTML")
+            return
+
+        await update.message.reply_text(f"📖 Generating Weekly Master Study Guide for <b>{found_pair.name}</b>...", parse_mode="HTML")
+        notes = db.get_recent_class_context(found_pair.name, limit=10)
+        summary_text = ai_enhancer.generate_weekly_summary(found_pair.name, notes)
+
+        await update.message.reply_text(summary_text, parse_mode="HTML")
 
     async def prompt_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -646,15 +741,15 @@ class TelegramCopierBot:
     ) -> None:
         """Explanatory guide."""
         msg = (
-            "📖 <b>Conversational Bot Management Guide</b>\n\n"
-            "<b>Chat with the bot naturally:</b>\n"
-            "You can type plain messages to the bot in private chat to manage settings!\n\n"
-            "<b>Examples:</b>\n"
-            "• <i>'Set Chemistry 1 delay to 180 seconds'</i>\n"
-            "• <i>'Make Chemistry 2 posts simple with key points'</i>\n"
-            "• <i>'Pause Biology 1 class for today'</i>\n\n"
-            "<b>Discussion Group Q&A:</b>\n"
-            "Students can tag <code>@Iconic_impact_tutor_bot</code> in discussion groups to get helpful answers using class notes + general knowledge!"
+            "📖 <b>High-Impact AI Features Guide</b>\n\n"
+            "<b>1. Interactive Practice Quizzes (`/quiz`):</b>\n"
+            "Generate multiple-choice practice quiz polls directly in class channels!\n"
+            "Example: <code>/quiz Chemistry 1</code>\n\n"
+            "<b>2. Weekly Master Study Guide (`/summary`):</b>\n"
+            "Generate exam review study guides for students.\n"
+            "Example: <code>/summary Biology 1</code>\n\n"
+            "<b>3. Conversational AI Manager:</b>\n"
+            "Type plain messages in chat to configure settings (e.g. <i>'Set Chemistry 1 delay to 180s'</i>)!"
         )
         await update.message.reply_text(msg, parse_mode="HTML")
 
@@ -668,7 +763,7 @@ class TelegramCopierBot:
 
         active_pairs = [p for p in self.pairs if p.is_active]
         total_queued = sum(p.queue.qsize() for p in self.pairs)
-        has_ai = "🟢 Enabled (Free Gemini API)" if os.getenv("GEMINI_API_KEY") else "⚪ Disabled"
+        has_ai = "🟢 Enabled (Gemini / DeepSeek API)" if (os.getenv("GEMINI_API_KEY") or os.getenv("DEEPSEEK_API_KEY")) else "⚪ Disabled"
 
         msg = (
             "⚙️ <b>Bot System Dashboard</b>\n\n"
@@ -677,8 +772,8 @@ class TelegramCopierBot:
             f"• <b>Total Class Channels:</b> {len(self.pairs)}\n"
             f"• 🟢 <b>Active Right Now:</b> {len(active_pairs)}\n"
             f"• 📬 <b>Messages Queued:</b> {total_queued}\n"
-            f"• 💬 <b>Conversational AI Assistant:</b> 🟢 Active\n"
-            f"• 🎓 <b>Discussion Q&A AI:</b> 🟢 Enabled\n"
+            f"• 🧠 <b>Practice Quizzes:</b> 🟢 Enabled (`/quiz`)\n"
+            f"• 📖 <b>Master Study Guides:</b> 🟢 Enabled (`/summary`)\n"
             f"• 🤖 <b>AI Status:</b> {has_ai}\n"
         )
         await update.message.reply_text(msg, parse_mode="HTML")
@@ -921,16 +1016,17 @@ class TelegramCopierBot:
         start_dummy_web_server()
 
         commands = [
-            BotCommand("start", "Welcome message & quick menu"),
+            BotCommand("start", "AI Setup Wizard & welcome menu"),
+            BotCommand("quiz", "Generate interactive practice quiz poll"),
+            BotCommand("summary", "Generate weekly master study guide"),
             BotCommand("pairs", "View exact classes, spacing & AI status"),
             BotCommand("prompt", "Set custom AI instructions per class"),
-            BotCommand("ai", "Configure AI mode per class (flow, off)"),
             BotCommand("setdelay", "Dictate message spacing per class"),
             BotCommand("schedule", "View weekly class timetable"),
             BotCommand("activate", "Toggle class active state (Admin)"),
             BotCommand("addadmin", "Authorize another bot admin (Admin)"),
             BotCommand("status", "System status & message queues"),
-            BotCommand("help", "Beginner guide & help tips"),
+            BotCommand("help", "Beginner guide & high-impact tips"),
         ]
         await application.bot.set_my_commands(commands)
 
@@ -958,6 +1054,8 @@ class TelegramCopierBot:
 
         application.add_handler(CommandHandler("start", self.start_command))
         application.add_handler(CommandHandler("help", self.help_command))
+        application.add_handler(CommandHandler("quiz", self.quiz_command))
+        application.add_handler(CommandHandler("summary", self.summary_command))
         application.add_handler(CommandHandler("status", self.status_command))
         application.add_handler(CommandHandler("pairs", self.pairs_command))
         application.add_handler(CommandHandler("prompt", self.prompt_command))

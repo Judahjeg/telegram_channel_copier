@@ -63,13 +63,11 @@ def call_deepseek_api(prompt_text: str, timeout_sec: int = 15) -> Optional[str]:
 
 def call_ai_api(prompt_text: str, timeout_sec: int = 15) -> Optional[str]:
     """Call AI provider (DeepSeek API if configured, or Google Gemini API with fallbacks)."""
-    # 1. Try DeepSeek if key is set
     if DEEPSEEK_API_KEY:
         ds_res = call_deepseek_api(prompt_text, timeout_sec=timeout_sec)
         if ds_res:
             return ds_res
 
-    # 2. Try Gemini API
     if not GEMINI_API_KEY:
         return None
 
@@ -118,7 +116,7 @@ def call_ai_api(prompt_text: str, timeout_sec: int = 15) -> Optional[str]:
 def enhance_text_with_gemini(
     text: str, subject_name: str, mode: str = "flow", custom_instruction: Optional[str] = None
 ) -> str:
-    """Enhance educational post text using AI."""
+    """Enhance educational post text using AI and attach high-impact Exam Tips."""
     if not text or not text.strip() or mode == "off":
         return text
 
@@ -126,35 +124,35 @@ def enhance_text_with_gemini(
 
     if custom_instruction and custom_instruction.strip():
         prompt_text = (
-            f"You are an AI editor for {clean_name} educational posts. "
+            f"You are an AI master tutor for {clean_name} educational content. "
             f"Follow these custom user instructions to edit the post text below:\n"
             f"USER INSTRUCTION: {custom_instruction}\n\n"
             f"ORIGINAL POST TEXT:\n{text}\n\n"
-            "Output ONLY the final edited post text:"
+            "Output the final edited post text, and append a short '💡 Key Exam Tip' at the very bottom:"
         )
     else:
         prompts = {
             "flow": (
-                f"You are an editor for {clean_name} educational content. "
-                "Slightly polish the following post to make sentences flow smoothly and improve readability/formatting. "
-                "DO NOT change the meaning, tone, facts, formulas, or remove any details. Keep it very close to original. Output ONLY the polished text:\n\n"
+                f"You are an expert tutor for {clean_name}. "
+                "Polish the following lesson post to make sentences flow smoothly, format key terms in bold, and improve readability. "
+                "DO NOT change facts or formulas. At the bottom, add a 1-sentence '💡 Key Exam Tip:' relevant to the lesson.\n\n"
                 f"{text}"
             ),
             "polish": (
-                f"You are an editor for {clean_name} educational content. "
-                "Slightly polish the following post to make sentences flow smoothly and improve readability/formatting. "
-                "DO NOT change the meaning, tone, facts, formulas, or remove any details. Keep it very close to original. Output ONLY the polished text:\n\n"
+                f"You are an expert tutor for {clean_name}. "
+                "Polish the following lesson post to make sentences flow smoothly, format key terms in bold, and improve readability. "
+                "At the bottom, add a 1-sentence '💡 Key Exam Tip:' relevant to the lesson.\n\n"
                 f"{text}"
             ),
             "paraphrase": (
-                f"You are an expert tutor for {clean_name}. "
-                "Rewrite the following lesson post to make it highly engaging, clear, and easy for students to study. "
-                "Preserve all facts, math formulas, and key details. Output ONLY the rewritten post:\n\n"
+                f"You are a master tutor for {clean_name}. "
+                "Rewrite the following lesson post to make it highly engaging and clear for students. "
+                "Preserve all facts and formulas. Append a '💡 Iconic Exam Tip:' box at the bottom:\n\n"
                 f"{text}"
             ),
             "summarize": (
                 f"You are a study guide generator for {clean_name}. "
-                "Summarize the following post into key study takeaways with bullet points. Output ONLY the summary:\n\n"
+                "Summarize the following post into bullet points. Include a '🔑 Core Takeaway:' box at the bottom:\n\n"
                 f"{text}"
             ),
             "hashtags": (
@@ -169,7 +167,7 @@ def enhance_text_with_gemini(
 
     result = call_ai_api(prompt_text)
     if result:
-        logger.info(f"[AI Enhancer] Enhanced post for {clean_name}.")
+        logger.info(f"[AI Enhancer] Enhanced post with Exam Tip for {clean_name}.")
         return result
 
     return text
@@ -178,7 +176,7 @@ def enhance_text_with_gemini(
 def answer_student_question(
     question: str, subject_name: str, class_context_texts: List[str]
 ) -> str:
-    """Answer student questions in Discussion Groups using class notes if relevant, or general knowledge."""
+    """Answer student questions in Discussion Groups using Socratic step-by-step guidance."""
     clean_name = clean_subject_name(subject_name)
 
     context_block = ""
@@ -189,10 +187,9 @@ def answer_student_question(
     prompt_text = (
         f"You are an encouraging, expert AI Tutor for '{clean_name}'. "
         "A student asked a question in the class discussion group. "
-        "Answer their question directly, clearly, accurately, and thoroughly. "
-        "Use the class notes below as a helpful reference if relevant, but if the answer is not in the notes, "
-        "use your full general academic knowledge to provide a complete answer. "
-        "Do NOT use meta-phrases like 'Here is a helpful answer' or 'according to the notes'. Answer the question directly.\n"
+        "Provide a high-impact, step-by-step explanation. "
+        "Format your answer with bullet points or numbered steps if solving a problem. "
+        "Use the class notes below if relevant, but draw from your general academic knowledge if needed.\n"
         f"{context_block}\n"
         f"STUDENT QUESTION:\n{question}\n\n"
         "TUTOR ANSWER:"
@@ -203,27 +200,80 @@ def answer_student_question(
         logger.info(f"[AI Q&A] Answered student question for {clean_name}.")
         return f"🎓 <b>{clean_name} Tutor</b>:\n\n{answer}"
 
-    return f"🎓 <b>{clean_name} Tutor</b>:\n\nThank you for asking! Let me look into that question and get back to you shortly."
+    return f"🎓 <b>{clean_name} Tutor</b>:\n\nThank you for asking! Let me review the formula and get back to you shortly."
+
+
+def generate_class_quiz(subject_name: str, class_context_texts: List[str]) -> Optional[Dict[str, Any]]:
+    """Generate an interactive multiple-choice practice quiz payload based on recent class lessons."""
+    clean_name = clean_subject_name(subject_name)
+    context_block = "\n".join(class_context_texts) if class_context_texts else "General syllabus concepts"
+
+    prompt_text = (
+        f"Generate a high-impact multiple choice practice quiz question for '{clean_name}' based on these notes:\n"
+        f"{context_block}\n\n"
+        "Return ONLY a JSON object with this exact structure (no markdown fences):\n"
+        '{"question": "What is ...?", "options": ["Option A", "Option B", "Option C", "Option D"], "correct_option_id": 0, "explanation": "Explanation why Option A is correct."}'
+    )
+
+    res = call_ai_api(prompt_text, timeout_sec=15)
+    if res:
+        try:
+            # Clean possible markdown block
+            clean_json = res.replace("```json", "").replace("```", "").strip()
+            data = json.loads(clean_json)
+            if "question" in data and "options" in data and "correct_option_id" in data:
+                return data
+        except Exception as e:
+            logger.warning(f"Error parsing quiz JSON: {e}")
+
+    return None
+
+
+def generate_weekly_summary(subject_name: str, class_context_texts: List[str]) -> str:
+    """Generate a Weekly Master Study Guide for exam review."""
+    clean_name = clean_subject_name(subject_name)
+    if not class_context_texts:
+        return f"📖 <b>{clean_name} Master Study Guide</b>\n\nNo class lesson posts recorded yet for this week."
+
+    context_block = "\n---\n".join(class_context_texts)
+    prompt_text = (
+        f"You are a master study guide author for '{clean_name}'. "
+        "Create a comprehensive, beautifully formatted Weekly Exam Review Digest from these lesson notes:\n"
+        f"{context_block}\n\n"
+        "Include:\n"
+        "1. 🔑 Key Concepts & Definitions\n"
+        "2. 🧮 Essential Formulas / Core Facts\n"
+        "3. 🎯 Top 3 Exam Traps to Avoid\n\n"
+        "Format cleanly in HTML tags (<b>, <i>, <code>):"
+    )
+
+    res = call_ai_api(prompt_text, timeout_sec=18)
+    if res:
+        return f"📖 <b>{clean_name} Master Weekly Study Guide</b>\n\n{res}"
+
+    return f"📖 <b>{clean_name} Master Study Guide</b>\n\nFailed to generate summary. Please try again shortly."
 
 
 def process_admin_conversational_assistant(
     user_message: str, class_pairs_summary: str, is_admin: bool
 ) -> str:
-    """Conversational AI Assistant that helps administrators configure and manage the bot via natural language."""
+    """Conversational AI Setup Wizard & Assistant for managing the bot via natural language."""
     if not is_admin:
         return "⛔ <b>Access Denied:</b> Only authorized bot administrators can manage bot settings."
 
     prompt_text = (
-        "You are an intelligent, friendly AI Manager Assistant for the 'Iconic Impact Tutor' Telegram Bot. "
-        "The user is managing their channel copier bot via natural language. "
+        "You are the Intelligent Setup Wizard & AI Manager Assistant for 'Iconic Impact Tutor' Telegram Bot. "
+        "Your job is to guide the user in natural language to set up, configure, and maximize student impact for their classes.\n\n"
         "Available Classes & Config:\n"
         f"{class_pairs_summary}\n\n"
         "If the user wants to perform a bot action, respond by starting your message with one of these ACTION intent codes, followed by a friendly explanation:\n"
         "- `ACTION:SETDELAY|<Class_Name>|<Seconds>` (e.g. `ACTION:SETDELAY|Chemistry 1|180`)\n"
         "- `ACTION:PROMPT|<Class_Name>|<Custom_Instruction>` (e.g. `ACTION:PROMPT|Biology 1|Keep sentences simple`)\n"
         "- `ACTION:ACTIVATE|<Class_Name>` (e.g. `ACTION:ACTIVATE|Physics`)\n"
-        "- `ACTION:HELP` (General assistance)\n"
-        "If the user is asking a general question about how to use the bot, explain clearly in simple English.\n\n"
+        "- `ACTION:QUIZ|<Class_Name>` (e.g. `ACTION:QUIZ|Chemistry 1`)\n"
+        "- `ACTION:SUMMARY|<Class_Name>` (e.g. `ACTION:SUMMARY|Biology 1`)\n"
+        "- `ACTION:HELP` (Setup guidance)\n\n"
+        "If the user says 'start', 'help', or asks how to set up, provide a high-energy welcome wizard explaining how you can set up their classes, message delays, custom AI prompts, and practice quizzes!\n\n"
         f"USER MESSAGE: {user_message}\n\n"
         "RESPONSE:"
     )
@@ -233,6 +283,7 @@ def process_admin_conversational_assistant(
         return result
 
     return (
-        "🤖 <b>AI Assistant</b>: I am here to help you manage your bot! "
-        "You can tell me things like <i>'Set Chemistry 1 delay to 3 minutes'</i> or <i>'Make Biology posts simple'</i>."
+        "🧙‍♂️ <b>AI Setup Wizard</b>: Welcome! I am your AI Manager Assistant. "
+        "I can help you set up your classes, dictate message spacing (e.g. <i>'Set Chemistry 1 spacing to 3 mins'</i>), "
+        "custom AI prompts, or generate practice quizzes (<i>'Create a quiz for Chemistry 1'</i>)!"
     )
