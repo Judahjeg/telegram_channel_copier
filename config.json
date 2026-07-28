@@ -1,0 +1,67 @@
+[
+  {
+    "name": "Biology",
+    "source_chat_id": -1001234567891,
+    "destination_chat_id": -1009876543211,
+    "start_message_id": 100,
+    "delay_min_seconds": 180,
+    "delay_max_seconds": 180,
+    "schedule": {
+      "active_days": ["Monday", "Wednesday"],
+      "start_time": "08:00",
+      "end_time": "16:00"
+    }
+  },
+  {
+    "name": "Chemistry",
+    "source_chat_id": -1001234567892,
+    "destination_chat_id": -1009876543212,
+    "start_message_id": 100,
+    "delay_min_seconds": 120,
+    "delay_max_seconds": 240,
+    "schedule": {
+      "active_days": ["Tuesday", "Thursday"],
+      "start_time": "09:00",
+      "end_time": "17:00"
+    }
+  },
+  {
+    "name": "Physics",
+    "source_chat_id": -1001234567893,
+    "destination_chat_id": -1009876543213,
+    "start_message_id": 100,
+    "delay_min_seconds": 60,
+    "delay_max_seconds": 120,
+    "schedule": {
+      "active_days": ["Friday"],
+      "start_time": "10:00",
+      "end_time": "15:00"
+    }
+  },
+  {
+    "name": "Mathematics",
+    "source_chat_id": -1001234567894,
+    "destination_chat_id": -1009876543214,
+    "start_message_id": 100,
+    "delay_min_seconds": 300,
+    "delay_max_seconds": 300,
+    "schedule": {
+      "active_days": ["Monday", "Friday"],
+      "start_time": "13:00",
+      "end_time": "18:00"
+    }
+  },
+  {
+    "name": "History",
+    "source_chat_id": -1001234567895,
+    "destination_chat_id": -1009876543215,
+    "start_message_id": 100,
+    "delay_min_seconds": 120,
+    "delay_max_seconds": 180,
+    "schedule": {
+      "active_days": ["Saturday"],
+      "start_time": "09:00",
+      "end_time": "14:00"
+    }
+  }
+]

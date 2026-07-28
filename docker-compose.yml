@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  telegram-copier:
+    build: .
+    container_name: telegram_channel_copier
+    restart: unless-stopped
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+    volumes:
+      - ./config.json:/app/config.json
+      - ./copier.db:/app/copier.db

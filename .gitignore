@@ -1,0 +1,16 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Database files
+*.db
+copier.db
+test_copier.db
+
+# Virtual environments
+venv/
+.venv/
+
+# Secret files & environment
+.env
+run_bot.sh
