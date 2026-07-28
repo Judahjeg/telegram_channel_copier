@@ -283,7 +283,6 @@ class TelegramCopierBot:
 
                 raw_text = item.get("text", "")
 
-                # Perform strict sanitization to strip phone numbers, @usernames, WhatsApp links, and promo text
                 sanitized_text = ai_enhancer.sanitize_text(raw_text)
 
                 if sanitized_text:
@@ -374,6 +373,7 @@ class TelegramCopierBot:
         """Handle AI Q&A when students tag the bot or reply to bot in Discussion Groups."""
         message = update.effective_message
         chat = update.effective_chat
+        user = update.effective_user
         bot_user = context.bot.username
 
         if not message or not chat or not message.text:
@@ -396,7 +396,8 @@ class TelegramCopierBot:
         if bot_user:
             question = question.replace(f"@{bot_user}", "").strip()
 
-        logger.info(f"Received Q&A question in '{chat.title or chat.id}' for exact class '{exact_class_name}': '{question}'")
+        user_display_name = user.first_name if user else "Student"
+        logger.info(f"Received Q&A question from {user_display_name} in '{chat.title or chat.id}' for exact class '{exact_class_name}': '{question}'")
 
         context_notes = []
         if pair:
@@ -406,6 +407,14 @@ class TelegramCopierBot:
             question=question,
             subject_name=exact_class_name,
             class_context_texts=context_notes,
+        )
+
+        # Audit Log: Save student question and AI answer into SQLite database
+        db.save_qa_log(
+            subject_name=exact_class_name,
+            user_name=user_display_name,
+            question=question,
+            answer=ai_response,
         )
 
         await message.reply_text(ai_response, parse_mode="HTML")
@@ -472,9 +481,12 @@ class TelegramCopierBot:
             except Exception as e:
                 logger.error(f"Error executing AI action QUIZ: {e}")
 
-        # Clean raw action codes before sending text to user
+        elif "ACTION:LOGS" in ai_reply:
+            await self.logs_command(update, context)
+            return
+
         clean_response = ai_reply
-        for prefix in ("ACTION:SETDELAY|", "ACTION:PROMPT|", "ACTION:ACTIVATE|", "ACTION:QUIZ|", "ACTION:SUMMARY|", "ACTION:HELP"):
+        for prefix in ("ACTION:SETDELAY|", "ACTION:PROMPT|", "ACTION:ACTIVATE|", "ACTION:QUIZ|", "ACTION:SUMMARY|", "ACTION:LOGS", "ACTION:HELP"):
             if prefix in clean_response:
                 clean_response = clean_response.split(prefix)[0] + "\n" + clean_response.split(prefix)[1].split("\n", 1)[-1]
 
@@ -505,7 +517,6 @@ class TelegramCopierBot:
         msg_text = message.text or message.caption or ""
         reply_to_id = message.reply_to_message.message_id if message.reply_to_message else None
 
-        # Multimodal Vision OCR: If message has a photo, run Vision OCR to extract & sanitize lesson text from image
         if message.photo and os.getenv("GEMINI_API_KEY"):
             try:
                 photo_file = await context.bot.get_file(message.photo[-1].file_id)
@@ -516,7 +527,6 @@ class TelegramCopierBot:
             except Exception as e:
                 logger.debug(f"Vision OCR processing note: {e}")
 
-        # Apply strict regex & keyword sanitization
         sanitized_msg_text = ai_enhancer.sanitize_text(msg_text)
 
         for pair in matching_pairs:
@@ -566,38 +576,74 @@ class TelegramCopierBot:
     async def start_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Welcome message and interactive AI Setup Wizard."""
+        """Welcome message, bot channels location overview, and AI Setup Wizard."""
         user = update.effective_user
         active_count = sum(1 for p in self.pairs if p.is_active)
         has_ai = "🟢 Active (Gemini / DeepSeek API)" if (os.getenv("GEMINI_API_KEY") or os.getenv("DEEPSEEK_API_KEY")) else "⚪ Disabled"
 
+        # List where bot is currently added
+        channel_locations = []
+        for p in self.pairs:
+            disc_str = f" | Discussion ID: <code>{p.discussion_chat_id}</code>" if p.discussion_chat_id else ""
+            channel_locations.append(
+                f"• <b>{p.name}:</b> Source <code>{p.source_chat_id}</code> ➔ Destination <code>{p.destination_chat_id}</code>{disc_str}"
+            )
+
+        locations_block = "\n".join(channel_locations) if channel_locations else "<i>No channels connected yet.</i>"
+
         msg = (
             f"🧙‍♂️ <b>Welcome to Iconic Impact Tutor Setup Wizard, {user.first_name if user else 'User'}!</b>\n\n"
             f"Your Telegram User ID: <code>{user.id if user else 'Unknown'}</code>\n\n"
-            "I am your Intelligent AI Manager & Class Assistant! I can help you set up your classes, customize prompts, dictates message spacing, or post practice quizzes.\n\n"
-            f"📊 <b>Current Setup:</b>\n"
-            f"• <b>Total Class Channels:</b> {len(self.pairs)}\n"
-            f"• 🟢 <b>Active Classes:</b> {active_count}\n"
-            f"• 🛡️ <b>Anonymization & Vision OCR:</b> 🟢 Active\n"
-            f"• 🧠 <b>Practice Quizzes:</b> 🟢 Active (`/quiz`)\n"
-            f"• 📖 <b>Weekly Study Guides:</b> 🟢 Active (`/summary`)\n"
+            "I am your Intelligent AI Manager & Class Assistant! I help you configure classes, dictate message spacing, upload timetables, view student interaction logs, and post practice quizzes.\n\n"
+            f"📍 <b>Where Bot is Currently Added & Active:</b>\n"
+            f"{locations_block}\n\n"
+            f"📊 <b>Bot Overview:</b>\n"
+            f"• <b>Total Connected Classes:</b> {len(self.pairs)}\n"
+            f"• 🟢 <b>Active Right Now:</b> {active_count}\n"
+            f"• 🛡️ <b>Priority Notes Check & Anonymization:</b> 🟢 Active\n"
+            f"• 📜 <b>Student Interaction Logs:</b> 🟢 Active (`/logs`)\n"
             f"• 🤖 <b>AI Engine:</b> {has_ai}\n\n"
-            "💬 <b>Chat with me in plain English!</b>\n"
-            "• <i>'How do I set up my classes?'</i>\n"
+            "💬 <b>Chat with me freely in plain English!</b>\n"
+            "• <i>'Show student interaction logs'</i>\n"
+            "• <i>'Where has the bot been added?'</i>\n"
             "• <i>'Set Chemistry 1 delay to 3 minutes'</i>\n"
-            "• <i>'Generate a practice quiz for Chemistry 1'</i>\n"
-            "• <i>'Make Biology 1 posts short with study tips'</i>\n\n"
+            "• <i>'Generate a practice quiz for Chemistry 1'</i>\n\n"
             "👇 <b>Quick Commands Menu:</b>\n"
+            "• /logs - View recent student Q&A interaction logs\n"
+            "• /schedule - View & manage weekly class timetables\n"
             "• /quiz - Generate interactive quiz for a class\n"
             "• /summary - Generate weekly master study guide\n"
-            "• /pairs - View exact classes & spacing\n"
+            "• /pairs - View connected channels & spacing\n"
             "• /prompt - Set custom AI instructions\n"
             "• /setdelay - Dictate message spacing\n"
-            "• /schedule - View weekly class timetable\n"
             "• /activate - Toggle class active state\n"
             "• /status - System dashboard\n"
         )
         await update.message.reply_text(msg, parse_mode="HTML")
+
+    async def logs_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """View recent student Q&A interaction logs across all discussion groups."""
+        user = update.effective_user
+        if user and not self.is_user_admin(user.id):
+            await update.message.reply_text("⛔ <b>Access Denied:</b> Only authorized bot admins can view student logs.", parse_mode="HTML")
+            return
+
+        logs = db.get_recent_qa_logs(limit=10)
+        if not logs:
+            await update.message.reply_text("📜 <b>Student Interaction Logs:</b>\n\nNo student Q&A interactions recorded yet.", parse_mode="HTML")
+            return
+
+        lines = ["📜 <b>Recent Student Interaction Logs:</b>\n"]
+        for log in logs:
+            lines.append(
+                f"👤 <b>{log['user_name']}</b> ({log['subject_name']}) - <i>{log['timestamp']}</i>\n"
+                f"❓ <b>Q:</b> <code>{log['question']}</code>\n"
+                f"💡 <b>A:</b> <i>{log['answer'][:150]}...</i>\n"
+            )
+
+        await update.message.reply_text("\n---\n".join(lines), parse_mode="HTML")
 
     async def post_class_quiz(self, pair: ChannelPair, context: ContextTypes.DEFAULT_TYPE) -> bool:
         """Helper to generate and post a Telegram native quiz into the destination chat."""
@@ -761,16 +807,14 @@ class TelegramCopierBot:
         """Explanatory guide."""
         msg = (
             "📖 <b>High-Impact AI Features Guide</b>\n\n"
-            "<b>1. Automatic Anonymization & Vision OCR:</b>\n"
-            "Strips tutor phone numbers, WhatsApp contacts, @usernames, watermarks, and promo text from both text and image posts!\n\n"
-            "<b>2. Interactive Practice Quizzes (`/quiz`):</b>\n"
-            "Generate multiple-choice practice quiz polls directly in class channels!\n"
-            "Example: <code>/quiz Chemistry 1</code>\n\n"
-            "<b>3. Weekly Master Study Guide (`/summary`):</b>\n"
-            "Generate exam review study guides for students.\n"
-            "Example: <code>/summary Biology 1</code>\n\n"
-            "<b>4. Conversational AI Manager:</b>\n"
-            "Type plain messages in chat to configure settings (e.g. <i>'Set Chemistry 1 delay to 180s'</i>)!"
+            "<b>1. Priority Lesson Notes Search:</b>\n"
+            "The AI tutor scans channel class notes first before answering student questions.\n\n"
+            "<b>2. Student Interaction Logs (`/logs`):</b>\n"
+            "View recent student questions and AI answers across all groups.\n\n"
+            "<b>3. Timetables & Location Overview (`/start`):</b>\n"
+            "View connected channels and active class timetables.\n\n"
+            "<b>4. Conversational Navigation Assistant:</b>\n"
+            "Chat freely in plain text to manage settings (e.g. <i>'Show student logs'</i>)!"
         )
         await update.message.reply_text(msg, parse_mode="HTML")
 
@@ -794,6 +838,7 @@ class TelegramCopierBot:
             f"• 🟢 <b>Active Right Now:</b> {len(active_pairs)}\n"
             f"• 📬 <b>Messages Queued:</b> {total_queued}\n"
             f"• 🛡️ <b>Anonymization & Vision OCR:</b> 🟢 Enabled\n"
+            f"• 📜 <b>Student Interaction Logs:</b> 🟢 Enabled (`/logs`)\n"
             f"• 🧠 <b>Practice Quizzes:</b> 🟢 Enabled (`/quiz`)\n"
             f"• 📖 <b>Master Study Guides:</b> 🟢 Enabled (`/summary`)\n"
             f"• 🤖 <b>AI Status:</b> {has_ai}\n"
@@ -808,7 +853,7 @@ class TelegramCopierBot:
             await update.message.reply_text("No channel pairs configured.")
             return
 
-        lines = ["📚 <b>Exact Class Channels, Spacing & AI Status:</b>\n"]
+        lines = ["📚 <b>Exact Class Channels, Locations & Spacing:</b>\n"]
         for p in self.pairs:
             status_icon = "🟢 <b>ACTIVE</b>" if p.is_active else "⏳ <b>DORMANT</b>"
             q_size = p.queue.qsize()
@@ -820,13 +865,16 @@ class TelegramCopierBot:
             else:
                 spacing_str = f"{p.delay_min_seconds:.0f}–{p.delay_max_seconds:.0f} sec"
 
+            disc_info = f"<code>{p.discussion_chat_id}</code>" if p.discussion_chat_id else "None"
+
             lines.append(
                 f"<b>Class: {p.name}</b>\n"
                 f"• Status: {status_icon}\n"
                 f"• Spacing: ⏱️ <b>{spacing_str}</b>\n"
                 f"• AI Settings: 🤖 {prompt_summary}\n"
-                f"• Source ID: <code>{p.source_chat_id}</code>\n"
-                f"• Destination ID: <code>{p.destination_chat_id}</code>\n"
+                f"• Source Channel ID: <code>{p.source_chat_id}</code>\n"
+                f"• Destination Channel ID: <code>{p.destination_chat_id}</code>\n"
+                f"• Discussion Group ID: {disc_info}\n"
                 f"• Last Copied Msg ID: <code>{p.last_processed_id}</code>\n"
                 f"• Queue Backlog: {q_size} pending\n"
             )
@@ -1038,17 +1086,18 @@ class TelegramCopierBot:
         start_dummy_web_server()
 
         commands = [
-            BotCommand("start", "AI Setup Wizard & welcome menu"),
+            BotCommand("start", "Location overview & AI setup wizard"),
+            BotCommand("logs", "View student Q&A interaction logs"),
             BotCommand("quiz", "Generate interactive practice quiz poll"),
             BotCommand("summary", "Generate weekly master study guide"),
-            BotCommand("pairs", "View exact classes, spacing & AI status"),
+            BotCommand("pairs", "View connected channels & spacing"),
             BotCommand("prompt", "Set custom AI instructions per class"),
             BotCommand("setdelay", "Dictate message spacing per class"),
-            BotCommand("schedule", "View weekly class timetable"),
+            BotCommand("schedule", "View weekly class timetables"),
             BotCommand("activate", "Toggle class active state (Admin)"),
             BotCommand("addadmin", "Authorize another bot admin (Admin)"),
             BotCommand("status", "System status & message queues"),
-            BotCommand("help", "Beginner guide & high-impact tips"),
+            BotCommand("help", "Beginner guide & help tips"),
         ]
         await application.bot.set_my_commands(commands)
 
@@ -1076,6 +1125,7 @@ class TelegramCopierBot:
 
         application.add_handler(CommandHandler("start", self.start_command))
         application.add_handler(CommandHandler("help", self.help_command))
+        application.add_handler(CommandHandler("logs", self.logs_command))
         application.add_handler(CommandHandler("quiz", self.quiz_command))
         application.add_handler(CommandHandler("summary", self.summary_command))
         application.add_handler(CommandHandler("status", self.status_command))

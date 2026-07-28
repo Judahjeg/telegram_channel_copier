@@ -30,15 +30,12 @@ def clean_telegram_formatting(text: str) -> str:
     if not text:
         return ""
 
-    # Strip markdown headers e.g. # Title or ### Title
     text = re.sub(r'^#+\s*', '', text, flags=re.MULTILINE)
     text = re.sub(r'\s+#+\s*', ' ', text)
 
-    # Convert markdown **bold** and *italic* to Telegram HTML <b> and <i>
     text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
     text = re.sub(r'\*(.*?)\*', r'<i>\1</i>', text)
 
-    # Strip common conversational AI filler intros and outros
     for filler in [
         "Here is the answer to your question:",
         "Here is a helpful answer to your question:",
@@ -298,22 +295,24 @@ def enhance_text_with_gemini(
 def answer_student_question(
     question: str, subject_name: str, class_context_texts: List[str]
 ) -> str:
-    """Answer student questions concisely and directly without filler intros, outro comments, or markdown hashes (#)."""
+    """Answer student questions: FIRST scan channel class notes. Only if answer is NOT in class notes, bring in general knowledge."""
     clean_name = clean_subject_name(subject_name)
 
     context_block = ""
     if class_context_texts:
         formatted_notes = "\n---\n".join([sanitize_text(t) for t in class_context_texts])
-        context_block = f"\nCLASS LESSON REFERENCE NOTES:\n{formatted_notes}\n"
+        context_block = f"\nCLASS LESSON REFERENCE NOTES (CHANNEL MATERIALS):\n{formatted_notes}\n"
 
     prompt_text = (
         f"You are an expert AI Tutor for '{clean_name}'. "
-        "A student asked a question in the class discussion group. "
-        "Provide a SHORT, CONCISE, DIRECT answer (maximum 2-3 short bullet points or 1 brief paragraph).\n"
-        "STRICT REQUIREMENTS:\n"
-        "1. Go STRAIGHT to the answer. Do NOT include intro filler (e.g., 'Here is your answer') or outro comments ('Hope this helps').\n"
-        "2. Do NOT use markdown hashes (#) or special heading characters. Use bold HTML (<b>term</b>) if needed.\n"
-        "3. Keep it brief, accurate, and direct.\n"
+        "A student asked a question in the class discussion group.\n"
+        "STRICT SOURCING RULE:\n"
+        "1. FIRST scan the CLASS LESSON REFERENCE NOTES below for the answer. If the answer is found in the class materials, answer strictly from those notes.\n"
+        "2. ONLY if the answer is NOT found in the class notes, bring in external academic knowledge to provide an accurate answer.\n\n"
+        "STRICT FORMATTING RULE:\n"
+        "- Provide a SHORT, CONCISE, DIRECT answer (maximum 2-3 short bullet points or 1 brief paragraph).\n"
+        "- Go STRAIGHT to the answer. Do NOT include intro filler (e.g. 'Here is your answer') or outro comments.\n"
+        "- Do NOT use markdown hashes (#).\n\n"
         f"{context_block}\n"
         f"STUDENT QUESTION:\n{question}\n\n"
         "DIRECT ANSWER:"
@@ -381,13 +380,13 @@ def generate_weekly_summary(subject_name: str, class_context_texts: List[str]) -
 def process_admin_conversational_assistant(
     user_message: str, class_pairs_summary: str, is_admin: bool
 ) -> str:
-    """Conversational AI Setup Wizard & Assistant for managing the bot via natural language."""
+    """Conversational AI Setup Wizard & Navigation Assistant for managing the bot via natural language."""
     if not is_admin:
         return "⛔ <b>Access Denied:</b> Only authorized bot administrators can manage bot settings."
 
     prompt_text = (
         "You are the Intelligent Setup Wizard & AI Manager Assistant for 'Iconic Impact Tutor' Telegram Bot. "
-        "Your job is to guide the user in natural language to set up, configure, and maximize student impact for their classes.\n\n"
+        "Your job is to guide the user in natural language to set up, configure, view interaction logs, and navigate the bot.\n\n"
         "Available Classes & Config:\n"
         f"{class_pairs_summary}\n\n"
         "If the user wants to perform a bot action, respond by starting your message with one of these ACTION intent codes, followed by a friendly explanation:\n"
@@ -396,8 +395,9 @@ def process_admin_conversational_assistant(
         "- `ACTION:ACTIVATE|<Class_Name>` (e.g. `ACTION:ACTIVATE|Physics`)\n"
         "- `ACTION:QUIZ|<Class_Name>` (e.g. `ACTION:QUIZ|Chemistry 1`)\n"
         "- `ACTION:SUMMARY|<Class_Name>` (e.g. `ACTION:SUMMARY|Biology 1`)\n"
+        "- `ACTION:LOGS` (View student interaction logs)\n"
         "- `ACTION:HELP` (Setup guidance)\n\n"
-        "If the user says 'start', 'help', or asks how to set up, provide a high-energy welcome wizard explaining how you can set up their classes, message delays, custom AI prompts, and practice quizzes!\n\n"
+        "If the user says 'start', 'help', or asks how to set up, provide a friendly welcome wizard explaining where the bot is added, timetable setup, custom AI prompts, and student interaction logs!\n\n"
         f"USER MESSAGE: {user_message}\n\n"
         "RESPONSE:"
     )
@@ -408,6 +408,6 @@ def process_admin_conversational_assistant(
 
     return (
         "🧙‍♂️ <b>AI Setup Wizard</b>: Welcome! I am your AI Manager Assistant. "
-        "I can help you set up your classes, dictate message spacing (e.g. <i>'Set Chemistry 1 spacing to 3 mins'</i>), "
-        "custom AI prompts, or generate practice quizzes (<i>'Create a quiz for Chemistry 1'</i>)!"
+        "I can help you view where the bot is added, set class timetables, dictate message spacing (e.g. <i>'Set Chemistry 1 spacing to 3 mins'</i>), "
+        "or view student Q&A logs (<i>'Show student logs'</i>)!"
     )
