@@ -380,34 +380,34 @@ def generate_weekly_summary(subject_name: str, class_context_texts: List[str]) -
 def process_admin_conversational_assistant(
     user_message: str, class_pairs_summary: str, is_admin: bool
 ) -> str:
-    """Conversational AI Setup Wizard & Navigation Assistant for managing the bot via natural language."""
+    """Fully Conversational AI Manager Co-Pilot that understands natural English and emits structured execution actions."""
     if not is_admin:
         return "⛔ <b>Access Denied:</b> Only authorized bot administrators can manage bot settings."
 
     prompt_text = (
-        "You are the Intelligent Setup Wizard & AI Manager Assistant for 'Iconic Impact Tutor' Telegram Bot. "
-        "Your job is to guide the user in natural language to set up, configure, view interaction logs, and navigate the bot.\n\n"
-        "Available Classes & Config:\n"
+        "You are an expert, warm, and highly intelligent AI Manager Co-Pilot for the 'Iconic Impact Tutor' Telegram Bot. "
+        "You are chatting naturally with the bot administrator in private Telegram chat. "
+        "Respond warmly, conversationally, and helpfully like a human co-teacher.\n\n"
+        "CURRENT BOT CONFIGURATION & CLASSES:\n"
         f"{class_pairs_summary}\n\n"
-        "If the user wants to perform a bot action, respond by starting your message with one of these ACTION intent codes, followed by a friendly explanation:\n"
-        "- `ACTION:SETDELAY|<Class_Name>|<Seconds>` (e.g. `ACTION:SETDELAY|Chemistry 1|180`)\n"
-        "- `ACTION:PROMPT|<Class_Name>|<Custom_Instruction>` (e.g. `ACTION:PROMPT|Biology 1|Keep sentences simple`)\n"
-        "- `ACTION:ACTIVATE|<Class_Name>` (e.g. `ACTION:ACTIVATE|Physics`)\n"
-        "- `ACTION:QUIZ|<Class_Name>` (e.g. `ACTION:QUIZ|Chemistry 1`)\n"
-        "- `ACTION:SUMMARY|<Class_Name>` (e.g. `ACTION:SUMMARY|Biology 1`)\n"
-        "- `ACTION:LOGS` (View student interaction logs)\n"
-        "- `ACTION:HELP` (Setup guidance)\n\n"
-        "If the user says 'start', 'help', or asks how to set up, provide a friendly welcome wizard explaining where the bot is added, timetable setup, custom AI prompts, and student interaction logs!\n\n"
-        f"USER MESSAGE: {user_message}\n\n"
-        "RESPONSE:"
+        "INSTRUCTION PARSING INSTRUCTIONS:\n"
+        "If the administrator asks you to perform an action or change a setting (e.g., activating a class, turning off a class, changing delays, setting custom AI prompt instructions, generating a quiz, or showing logs), respond conversationally AND append a hidden execution tag at the very end of your response:\n"
+        "- `<ACTION>{\"type\": \"activate\", \"class\": \"<Class_Name>\", \"value\": true}</ACTION>`\n"
+        "- `<ACTION>{\"type\": \"activate\", \"class\": \"<Class_Name>\", \"value\": false}</ACTION>`\n"
+        "- `<ACTION>{\"type\": \"setdelay\", \"class\": \"<Class_Name>\", \"value\": <seconds>}</ACTION>`\n"
+        "- `<ACTION>{\"type\": \"setprompt\", \"class\": \"<Class_Name>\", \"value\": \"<custom_prompt_text>\"}</ACTION>`\n"
+        "- `<ACTION>{\"type\": \"quiz\", \"class\": \"<Class_Name>\"}</ACTION>`\n"
+        "- `<ACTION>{\"type\": \"summary\", \"class\": \"<Class_Name>\"}</ACTION>`\n"
+        "- `<ACTION>{\"type\": \"logs\"}</ACTION>`\n\n"
+        f"ADMINISTRATOR MESSAGE: {user_message}\n\n"
+        "CONVERSATIONAL CO-PILOT RESPONSE:"
     )
 
-    result = call_ai_api(prompt_text, timeout_sec=12)
+    result = call_ai_api(prompt_text, timeout_sec=15)
     if result:
-        return sanitize_text(result)
+        return result
 
     return (
-        "🧙‍♂️ <b>AI Setup Wizard</b>: Welcome! I am your AI Manager Assistant. "
-        "I can help you view where the bot is added, set class timetables, dictate message spacing (e.g. <i>'Set Chemistry 1 spacing to 3 mins'</i>), "
-        "or view student Q&A logs (<i>'Show student logs'</i>)!"
+        "🧙‍♂️ <b>AI Manager Co-Pilot</b>: I am here to help you manage your bot! "
+        "Chat with me naturally about any class setup, delays, custom prompts, or logs."
     )

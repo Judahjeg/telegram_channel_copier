@@ -124,7 +124,6 @@ class ChannelPair:
             return self.manual_override_active
 
         if now is None:
-            now = datetime.timezone.utc
             now = datetime.datetime.now(datetime.timezone.utc)
 
         if self.activate_at and now < self.activate_at:
@@ -423,7 +422,7 @@ class TelegramCopierBot:
     async def handle_admin_conversational_chat(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Instant Hybrid Natural Language Intent Handler: Parses actions instantly in 0.01s with zero API delay."""
+        """Conversational AI Manager Co-Pilot Handler: Understands natural English and executes actions via JSON action tags."""
         message = update.effective_message
         user = update.effective_user
 
@@ -434,82 +433,6 @@ class TelegramCopierBot:
             await message.reply_text("⛔ <b>Access Denied:</b> Only authorized bot administrators can manage bot settings.", parse_mode="HTML")
             return
 
-        text = message.text.strip()
-        t_lower = text.lower()
-
-        # ------------------------------------------------------------------
-        # Instant Intent Parser 1: Activate / Turn On / Start
-        # ------------------------------------------------------------------
-        if any(kw in t_lower for kw in ["activate", "turn on", "enable", "start", "unpause", "resume"]):
-            for pair in self.pairs:
-                if pair.name.lower() in t_lower or pair.name.lower().replace(" ", "") in t_lower.replace(" ", ""):
-                    pair.manual_override_active = True
-                    logger.info(f"Instant local intent: Activated {pair.name}")
-                    await message.reply_text(f"🎉 <b>Success!</b> Class '<b>{pair.name}</b>' has been <b>ACTIVATED 🟢</b>!", parse_mode="HTML")
-                    return
-
-            # If no pair name was specified, toggle or ask
-            if "all" in t_lower:
-                for pair in self.pairs:
-                    pair.manual_override_active = True
-                await message.reply_text("🎉 <b>Success!</b> ALL classes have been <b>ACTIVATED 🟢</b>!", parse_mode="HTML")
-                return
-
-        # ------------------------------------------------------------------
-        # Instant Intent Parser 2: Deactivate / Turn Off / Pause / Stop
-        # ------------------------------------------------------------------
-        if any(kw in t_lower for kw in ["deactivate", "turn off", "disable", "pause", "stop"]):
-            for pair in self.pairs:
-                if pair.name.lower() in t_lower or pair.name.lower().replace(" ", "") in t_lower.replace(" ", ""):
-                    pair.manual_override_active = False
-                    logger.info(f"Instant local intent: Deactivated {pair.name}")
-                    await message.reply_text(f"⏸️ <b>Success!</b> Class '<b>{pair.name}</b>' has been <b>DEACTIVATED ⏳</b>!", parse_mode="HTML")
-                    return
-
-            if "all" in t_lower:
-                for pair in self.pairs:
-                    pair.manual_override_active = False
-                await message.reply_text("⏸️ <b>Success!</b> ALL classes have been <b>DEACTIVATED ⏳</b>!", parse_mode="HTML")
-                return
-
-        # ------------------------------------------------------------------
-        # Instant Intent Parser 3: Set Delay / Message Spacing
-        # ------------------------------------------------------------------
-        if any(kw in t_lower for kw in ["delay", "spacing", "interval", "seconds", "minutes", "mins"]):
-            numbers = re.findall(r'\d+', text)
-            if numbers:
-                val = float(numbers[0])
-                if "min" in t_lower:
-                    val = val * 60
-
-                for pair in self.pairs:
-                    if pair.name.lower() in t_lower or pair.name.lower().replace(" ", "") in t_lower.replace(" ", ""):
-                        pair.delay_min_seconds = val
-                        pair.delay_max_seconds = val
-                        logger.info(f"Instant local intent: Set delay for {pair.name} to {val}s")
-                        await message.reply_text(
-                            f"✅ <b>Updated Message Spacing!</b>\n\nClass: <b>{pair.name}</b>\nNew Spacing: <b>{val:.0f} seconds</b> ({val/60:.1f} mins).",
-                            parse_mode="HTML",
-                        )
-                        return
-
-        # ------------------------------------------------------------------
-        # Instant Intent Parser 4: Show Logs / View Logs
-        # ------------------------------------------------------------------
-        if "log" in t_lower or "student" in t_lower or "interaction" in t_lower:
-            await self.logs_command(update, context)
-            return
-
-        # ------------------------------------------------------------------
-        # Instant Intent Parser 5: Show Pairs / Status / Where added
-        # ------------------------------------------------------------------
-        if any(kw in t_lower for kw in ["where", "pairs", "status", "overview", "channels", "list"]):
-            await self.pairs_command(update, context)
-            return
-
-        # ------------------------------------------------------------------
-        # Fallback to AI Manager Assistant for complex natural questions
-        # ------------------------------------------------------------------
         classes_summary = self.get_classes_summary()
         ai_reply = ai_enhancer.process_admin_conversational_assistant(
             user_message=message.text,
@@ -517,12 +440,43 @@ class TelegramCopierBot:
             is_admin=True,
         )
 
-        clean_response = ai_reply
-        for prefix in ("ACTION:SETDELAY|", "ACTION:PROMPT|", "ACTION:ACTIVATE|", "ACTION:QUIZ|", "ACTION:SUMMARY|", "ACTION:LOGS", "ACTION:HELP"):
-            if prefix in clean_response:
-                clean_response = clean_response.split(prefix)[0] + "\n" + clean_response.split(prefix)[1].split("\n", 1)[-1]
+        # Extract and execute hidden <ACTION> JSON payloads
+        action_matches = re.findall(r'<ACTION>(.*?)</ACTION>', ai_reply, re.DOTALL)
+        for act_str in action_matches:
+            try:
+                act_data = json.loads(act_str.strip())
+                act_type = act_data.get("type")
+                target_name = act_data.get("class")
+                target_pair = self.find_pair_by_name(target_name) if target_name else None
 
-        await message.reply_text(clean_response.strip(), parse_mode="HTML")
+                if act_type == "activate" and target_pair:
+                    target_pair.manual_override_active = bool(act_data.get("value", True))
+                    logger.info(f"Conversational AI executed activate for {target_pair.name}: {target_pair.manual_override_active}")
+
+                elif act_type == "setdelay" and target_pair:
+                    val = float(act_data.get("value", 180))
+                    target_pair.delay_min_seconds = val
+                    target_pair.delay_max_seconds = val
+                    logger.info(f"Conversational AI executed setdelay for {target_pair.name}: {val}s")
+
+                elif act_type == "setprompt" and target_pair:
+                    p_text = str(act_data.get("value", ""))
+                    db.save_custom_prompt(target_pair.name, p_text)
+                    logger.info(f"Conversational AI executed setprompt for {target_pair.name}: '{p_text}'")
+
+                elif act_type == "quiz" and target_pair:
+                    await self.post_class_quiz(target_pair, context)
+
+                elif act_type == "logs":
+                    await self.logs_command(update, context)
+                    return
+
+            except Exception as e:
+                logger.error(f"Error parsing conversational AI action payload: {e}")
+
+        # Strip hidden <ACTION> tags before sending conversational message to user
+        clean_text = re.sub(r'<ACTION>.*?</ACTION>', '', ai_reply, flags=re.DOTALL).strip()
+        await message.reply_text(clean_text, parse_mode="HTML")
 
     async def handle_incoming_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -623,22 +577,22 @@ class TelegramCopierBot:
         locations_block = "\n".join(channel_locations) if channel_locations else "<i>No channels connected yet.</i>"
 
         msg = (
-            f"🧙‍♂️ <b>Welcome to Iconic Impact Tutor Setup Wizard, {user.first_name if user else 'User'}!</b>\n\n"
+            f"🧙‍♂️ <b>Welcome to Iconic Impact Tutor AI Co-Pilot, {user.first_name if user else 'User'}!</b>\n\n"
             f"Your Telegram User ID: <code>{user.id if user else 'Unknown'}</code>\n\n"
-            "I am your Instant Bot Manager & Class Assistant! Chat with me in plain English to activate/deactivate classes, dictate message spacing, upload timetables, and view student logs.\n\n"
+            "I am your Conversational AI Manager Assistant! You can chat with me naturally in plain English about anything—turn off a class, change AI prompts, dictate message delays, or ask how to set up.\n\n"
             f"📍 <b>Where Bot is Currently Added & Active:</b>\n"
             f"{locations_block}\n\n"
             f"📊 <b>Bot Overview:</b>\n"
             f"• <b>Total Connected Classes:</b> {len(self.pairs)}\n"
             f"• 🟢 <b>Active Right Now:</b> {active_count}\n"
-            f"• ⚡ <b>Instant Intent Execution:</b> 🟢 0.01s Active\n"
+            f"• 💬 <b>Conversational AI Co-Pilot:</b> 🟢 Active\n"
             f"• 📜 <b>Student Interaction Logs:</b> 🟢 Active (`/logs`)\n"
             f"• 🤖 <b>AI Engine:</b> {has_ai}\n\n"
-            "💬 <b>Chat with me freely in plain English!</b>\n"
-            "• <i>'Activate Chemistry 1'</i> or <i>'Turn off Physics'</i>\n"
-            "• <i>'Set Chemistry 1 delay to 3 minutes'</i>\n"
-            "• <i>'Show student logs'</i>\n"
-            "• <i>'Where has the bot been added?'</i>\n\n"
+            "💬 <b>Chat with me naturally!</b>\n"
+            "• <i>'Hey bot, turn off Chemistry 1 for today'</i>\n"
+            "• <i>'Make Biology 1 posts short and simple'</i>\n"
+            "• <i>'Set Physics spacing to 3 minutes'</i>\n"
+            "• <i>'Show me the student logs'</i>\n\n"
             "👇 <b>Quick Commands Menu:</b>\n"
             "• /logs - View recent student Q&A interaction logs\n"
             "• /schedule - View & manage weekly class timetables\n"
@@ -837,12 +791,12 @@ class TelegramCopierBot:
     ) -> None:
         """Explanatory guide."""
         msg = (
-            "📖 <b>Instant Chat Control Guide</b>\n\n"
-            "<b>Chat with the bot in plain English to control everything:</b>\n"
-            "• <i>'Activate Chemistry 1'</i> or <i>'Turn off Physics'</i>\n"
-            "• <i>'Set Chemistry 1 delay to 180 seconds'</i>\n"
-            "• <i>'Show student logs'</i>\n"
-            "• <i>'Where is the bot added?'</i>"
+            "📖 <b>Conversational AI Co-Pilot Guide</b>\n\n"
+            "<b>Chat naturally with the bot about anything:</b>\n"
+            "• <i>'Hey bot, turn off Chemistry 1 for today'</i>\n"
+            "• <i>'Make Biology 1 posts short and simple'</i>\n"
+            "• <i>'Set Physics delay to 3 minutes'</i>\n"
+            "• <i>'Show me the student logs'</i>"
         )
         await update.message.reply_text(msg, parse_mode="HTML")
 
@@ -865,7 +819,7 @@ class TelegramCopierBot:
             f"• <b>Total Class Channels:</b> {len(self.pairs)}\n"
             f"• 🟢 <b>Active Right Now:</b> {len(active_pairs)}\n"
             f"• 📬 <b>Messages Queued:</b> {total_queued}\n"
-            f"• ⚡ <b>Instant Local Execution:</b> 🟢 Enabled (0.01s)\n"
+            f"• 💬 <b>Conversational AI Co-Pilot:</b> 🟢 Enabled\n"
             f"• 🛡️ <b>Anonymization & Vision OCR:</b> 🟢 Enabled\n"
             f"• 📜 <b>Student Interaction Logs:</b> 🟢 Enabled (`/logs`)\n"
             f"• 🧠 <b>Practice Quizzes:</b> 🟢 Enabled (`/quiz`)\n"
