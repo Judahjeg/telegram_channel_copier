@@ -25,6 +25,35 @@ def clean_subject_name(raw_name: str) -> str:
     return name
 
 
+def clean_telegram_formatting(text: str) -> str:
+    """Strips Markdown hashes (#), stray asterisks (*), and raw AI filler comments for clean Telegram display."""
+    if not text:
+        return ""
+
+    # Strip markdown headers e.g. # Title or ### Title
+    text = re.sub(r'^#+\s*', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\s+#+\s*', ' ', text)
+
+    # Convert markdown **bold** and *italic* to Telegram HTML <b> and <i>
+    text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
+    text = re.sub(r'\*(.*?)\*', r'<i>\1</i>', text)
+
+    # Strip common conversational AI filler intros and outros
+    for filler in [
+        "Here is the answer to your question:",
+        "Here is a helpful answer to your question:",
+        "Here is a helpful answer:",
+        "Here is the solution:",
+        "Sure! Here is the answer:",
+        "I hope this helps!",
+        "Let me know if you have more questions!",
+        "Hope this helps!"
+    ]:
+        text = re.sub(re.escape(filler), '', text, flags=re.IGNORECASE)
+
+    return text.strip()
+
+
 def sanitize_text(text: str) -> str:
     """Strictly strip tutor phone numbers, WhatsApp handles, Telegram usernames (@user), URLs, and promo comments."""
     if not text:
@@ -35,7 +64,6 @@ def sanitize_text(text: str) -> str:
 
     for line in lines:
         l_lower = line.lower()
-        # Skip lines that contain promotional contact keywords
         if any(kw in l_lower for kw in [
             "whatsapp", "dm me", "message me", "call me", "contact me", "private lesson",
             "private tutor", "join my channel", "t.me/", "subscribe", "vip group",
@@ -43,18 +71,15 @@ def sanitize_text(text: str) -> str:
         ]):
             continue
 
-        # Strip phone numbers (e.g. +2348012345678, 08012345678, +1-800-123-4567)
         line = re.sub(r'\+?\d{1,4}?[-.\s]?\(?\d{1,3}?\)?[-.\s]?\d{1,4}[-.\s]?\d{1,4}[-.\s]?\d{1,9}', '', line)
-        # Strip Telegram @usernames
         line = re.sub(r'@[a-zA-Z0-9_]{4,}', '', line)
-        # Strip website links
         line = re.sub(r'https?://\S+', '', line)
 
         cleaned_lines.append(line)
 
     result = "\n".join(cleaned_lines)
     result = re.sub(r'\n\s*\n+', '\n\n', result).strip()
-    return result
+    return clean_telegram_formatting(result)
 
 
 def call_deepseek_api(prompt_text: str, timeout_sec: int = 15) -> Optional[str]:
@@ -205,11 +230,10 @@ def sanitize_and_ocr_image(image_bytes: bytes, mime_type: str = "image/jpeg") ->
 def enhance_text_with_gemini(
     text: str, subject_name: str, mode: str = "flow", custom_instruction: Optional[str] = None
 ) -> str:
-    """Enhance educational post text using AI according to mode or custom user instructions, enforcing strict anonymization."""
+    """Enhance educational post text using AI according to mode or custom user instructions, enforcing strict anonymization and clean Telegram HTML."""
     if not text or not text.strip():
         return ""
 
-    # Always apply instant regex sanitization first
     sanitized = sanitize_text(text)
     if not sanitized or mode == "off":
         return sanitized
@@ -220,7 +244,8 @@ def enhance_text_with_gemini(
         prompt_text = (
             f"You are a strict content anonymizer and AI tutor for {clean_name}. "
             "Clean the post below. Remove all tutor phone numbers, WhatsApp links, personal @usernames, or promo text. "
-            f"Follow these custom instructions: {custom_instruction}\n\n"
+            f"Follow these custom instructions: {custom_instruction}\n"
+            "STRICT FORMATTING RULE: Do NOT use hashtags (#) or markdown headings. Use clean HTML bold tags (<b>term</b>) if needed.\n\n"
             f"POST TEXT:\n{sanitized}\n\n"
             "Output ONLY the final clean educational post text:"
         )
@@ -228,25 +253,28 @@ def enhance_text_with_gemini(
         prompts = {
             "flow": (
                 f"You are an expert tutor for {clean_name}. "
-                "Polish the following lesson post to make sentences flow smoothly, format key terms in bold, and improve readability. "
-                "STRICT REQUIREMENT: Remove any tutor contact numbers, WhatsApp details, or promotional commentary. Output ONLY the polished text:\n\n"
+                "Polish the following lesson post to make sentences flow smoothly and improve readability. "
+                "STRICT REQUIREMENTS:\n"
+                "1. Do NOT use markdown hashes (#) or special heading characters.\n"
+                "2. Remove any tutor contact numbers, WhatsApp details, or promotional commentary.\n"
+                "3. Output ONLY the polished text:\n\n"
                 f"{sanitized}"
             ),
             "polish": (
                 f"You are an expert tutor for {clean_name}. "
-                "Polish the following lesson post to make sentences flow smoothly, format key terms in bold, and improve readability. "
-                "Remove any tutor contact info or links. Output ONLY the polished text:\n\n"
+                "Polish the following lesson post to make sentences flow smoothly and improve readability. "
+                "Do NOT use markdown hashes (#). Output ONLY the polished text:\n\n"
                 f"{sanitized}"
             ),
             "paraphrase": (
                 f"You are a master tutor for {clean_name}. "
                 "Rewrite the following lesson post to make it highly engaging and clear for students. "
-                "Preserve all facts and formulas. Remove all personal contact numbers or external links. Output ONLY the rewritten post:\n\n"
+                "Preserve all facts and formulas. Do NOT use hashes (#). Output ONLY the rewritten post:\n\n"
                 f"{sanitized}"
             ),
             "summarize": (
                 f"You are a study guide generator for {clean_name}. "
-                "Summarize the following post into bullet points. Remove any personal tutor contacts. Output ONLY the summary:\n\n"
+                "Summarize the following post into bullet points. Do NOT use hashes (#). Output ONLY the summary:\n\n"
                 f"{sanitized}"
             ),
             "hashtags": (
@@ -270,7 +298,7 @@ def enhance_text_with_gemini(
 def answer_student_question(
     question: str, subject_name: str, class_context_texts: List[str]
 ) -> str:
-    """Answer student questions in Discussion Groups using Socratic step-by-step guidance."""
+    """Answer student questions concisely and directly without filler intros, outro comments, or markdown hashes (#)."""
     clean_name = clean_subject_name(subject_name)
 
     context_block = ""
@@ -279,20 +307,23 @@ def answer_student_question(
         context_block = f"\nCLASS LESSON REFERENCE NOTES:\n{formatted_notes}\n"
 
     prompt_text = (
-        f"You are an encouraging, expert AI Tutor for '{clean_name}'. "
+        f"You are an expert AI Tutor for '{clean_name}'. "
         "A student asked a question in the class discussion group. "
-        "Provide a high-impact, step-by-step explanation. "
-        "Format your answer with bullet points or numbered steps if solving a problem. "
-        "Use the class notes below if relevant, but draw from your general academic knowledge if needed.\n"
+        "Provide a SHORT, CONCISE, DIRECT answer (maximum 2-3 short bullet points or 1 brief paragraph).\n"
+        "STRICT REQUIREMENTS:\n"
+        "1. Go STRAIGHT to the answer. Do NOT include intro filler (e.g., 'Here is your answer') or outro comments ('Hope this helps').\n"
+        "2. Do NOT use markdown hashes (#) or special heading characters. Use bold HTML (<b>term</b>) if needed.\n"
+        "3. Keep it brief, accurate, and direct.\n"
         f"{context_block}\n"
         f"STUDENT QUESTION:\n{question}\n\n"
-        "TUTOR ANSWER:"
+        "DIRECT ANSWER:"
     )
 
     answer = call_ai_api(prompt_text, timeout_sec=15)
     if answer:
+        clean_ans = sanitize_text(answer)
         logger.info(f"[AI Q&A] Answered student question for {clean_name}.")
-        return f"🎓 <b>{clean_name} Tutor</b>:\n\n{sanitize_text(answer)}"
+        return f"🎓 <b>{clean_name} Tutor</b>:\n\n{clean_ans}"
 
     return f"🎓 <b>{clean_name} Tutor</b>:\n\nThank you for asking! Let me review the formula and get back to you shortly."
 
@@ -331,13 +362,13 @@ def generate_weekly_summary(subject_name: str, class_context_texts: List[str]) -
     context_block = "\n---\n".join([sanitize_text(t) for t in class_context_texts])
     prompt_text = (
         f"You are a master study guide author for '{clean_name}'. "
-        "Create a comprehensive, beautifully formatted Weekly Exam Review Digest from these lesson notes:\n"
+        "Create a concise Weekly Exam Review Digest from these lesson notes:\n"
         f"{context_block}\n\n"
         "Include:\n"
         "1. 🔑 Key Concepts & Definitions\n"
         "2. 🧮 Essential Formulas / Core Facts\n"
         "3. 🎯 Top 3 Exam Traps to Avoid\n\n"
-        "Format cleanly in HTML tags (<b>, <i>, <code>):"
+        "Format cleanly in HTML tags (<b>, <i>, <code>). Do NOT use markdown hashes (#):"
     )
 
     res = call_ai_api(prompt_text, timeout_sec=18)
@@ -373,7 +404,7 @@ def process_admin_conversational_assistant(
 
     result = call_ai_api(prompt_text, timeout_sec=12)
     if result:
-        return result
+        return sanitize_text(result)
 
     return (
         "🧙‍♂️ <b>AI Setup Wizard</b>: Welcome! I am your AI Manager Assistant. "
