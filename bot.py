@@ -746,28 +746,55 @@ class TelegramCopierBot:
             self.is_user_admin(user.id)
 
         args = context.args
-        if not args or len(args) < 3 or not args[-1].lstrip("-").isdigit() or not args[-2].lstrip("-").isdigit():
-            await update.message.reply_text(
-                "📦 <b>How to migrate old/previous materials into a new channel:</b>\n\n"
-                "Syntax: <code>/backfill ClassName start_id end_id</code>\n\n"
-                "<b>Example:</b>\n"
-                "<code>/backfill Mathematics 1 1 850</code>\n\n"
-                "<i>Tip: Open the OLD channel, right-click the first and last message you want to migrate, "
-                "and choose 'Copy Message Link'. The number at the end of each link is the message ID.</i>\n\n"
-                "⚠️ <b>Note:</b> Telegram's Bot API cannot read the *content* of old messages, only copy them "
-                "as-is. So AI cleanup/anonymization only runs on messages received live going forward — "
-                "backfilled posts keep their original captions untouched.",
-                parse_mode="HTML",
-            )
+        usage_text = (
+            "📦 <b>How to migrate old/previous materials into a new channel:</b>\n\n"
+            "<b>Option A - using an already-registered class:</b>\n"
+            "<code>/backfill ClassName start_id end_id</code>\n"
+            "Example: <code>/backfill Mathematics 1 1 850</code>\n\n"
+            "<b>Option B - raw channel IDs, no /addclass needed first:</b>\n"
+            "<code>/backfill source_channel_id dest_channel_id start_id end_id</code>\n"
+            "Example: <code>/backfill -1001111111111 -1002222222222 545 590</code>\n\n"
+            "<i>Tip: Open the OLD channel, right-click the first and last message you want to migrate, "
+            "and choose 'Copy Message Link'. The number at the end of each link is the message ID.</i>\n\n"
+            "⚠️ <b>Note:</b> Telegram's Bot API cannot read the *content* of old messages, only copy them "
+            "as-is. So AI cleanup/anonymization only runs on messages received live going forward — "
+            "backfilled posts keep their original captions untouched."
+        )
+
+        if not args or len(args) < 3:
+            await update.message.reply_text(usage_text, parse_mode="HTML")
             return
 
-        end_id = int(args[-1])
-        start_id = int(args[-2])
-        class_name = " ".join(args[:-2]).strip()
+        def is_int(s: str) -> bool:
+            return s.lstrip("-").isdigit()
 
-        found_pair = self.find_pair_by_name(class_name)
-        if not found_pair:
-            await update.message.reply_text(f"❌ Class '<b>{class_name}</b>' not found.", parse_mode="HTML")
+        # Option B: exactly 4 numeric args -> source_id dest_id start_id end_id, no registered pair needed.
+        if len(args) == 4 and all(is_int(a) for a in args):
+            source_id, dest_id, start_id, end_id = (int(a) for a in args)
+            pair_name = f"backfill_{source_id}_{dest_id}"
+            dest_label = str(dest_id)
+        elif is_int(args[-1]) and is_int(args[-2]):
+            # Option A: ClassName start_id end_id, using an already-registered pair.
+            end_id = int(args[-1])
+            start_id = int(args[-2])
+            class_name = " ".join(args[:-2]).strip()
+
+            found_pair = self.find_pair_by_name(class_name)
+            if not found_pair:
+                await update.message.reply_text(
+                    f"❌ Class '<b>{class_name}</b>' not found. Either register it first with "
+                    f"<code>/addclass</code>, or use raw channel IDs instead: "
+                    f"<code>/backfill source_id dest_id start_id end_id</code>.",
+                    parse_mode="HTML",
+                )
+                return
+
+            source_id = found_pair.source_chat_id
+            dest_id = found_pair.destination_chat_id
+            pair_name = found_pair.name
+            dest_label = found_pair.destination_title
+        else:
+            await update.message.reply_text(usage_text, parse_mode="HTML")
             return
 
         if start_id > end_id:
@@ -781,20 +808,20 @@ class TelegramCopierBot:
             return
 
         await update.message.reply_text(
-            f"📦 <b>Backfill started for {found_pair.name}!</b>\n"
+            f"📦 <b>Backfill started for {pair_name}!</b>\n"
             f"Migrating message IDs <code>{start_id}</code>–<code>{end_id}</code> ({total} messages) "
-            f"from the old channel into <b>{found_pair.destination_title}</b>.\n\n"
+            f"from <code>{source_id}</code> into <b>{dest_label}</b>.\n\n"
             f"You'll get progress updates here. This can take a while for large batches "
             f"since it's paced to avoid Telegram's flood limits.",
             parse_mode="HTML",
         )
 
         asyncio.create_task(
-            self._run_backfill(found_pair, start_id, end_id, update.effective_chat.id, context.application)
+            self._run_backfill(pair_name, source_id, dest_id, start_id, end_id, update.effective_chat.id, context.application)
         )
 
     async def _run_backfill(
-        self, pair: ChannelPair, start_id: int, end_id: int, notify_chat_id: int, application
+        self, pair_name: str, source_id: int, dest_id: int, start_id: int, end_id: int, notify_chat_id: int, application
     ) -> None:
         """Worker that walks a historical message ID range and copies each into the destination,
         pacing itself to stay under Telegram's flood-control limits and surviving transient errors."""
@@ -803,33 +830,33 @@ class TelegramCopierBot:
         failed = 0
         total = end_id - start_id + 1
 
-        logger.info(f"[Backfill:{pair.name}] Starting migration of IDs {start_id}-{end_id} ({total} messages).")
+        logger.info(f"[Backfill:{pair_name}] Starting migration of IDs {start_id}-{end_id} ({total} messages).")
 
         for msg_id in range(start_id, end_id + 1):
             try:
                 result = await self._call_with_retry(
                     application.bot.copy_message,
-                    chat_id=pair.destination_chat_id,
-                    from_chat_id=pair.source_chat_id,
+                    chat_id=dest_id,
+                    from_chat_id=source_id,
                     message_id=msg_id,
                 )
                 if result:
-                    db.save_message_mapping(pair.name, msg_id, result.message_id)
+                    db.save_message_mapping(pair_name, msg_id, result.message_id)
                     copied += 1
             except BadRequest as e:
                 # Expected for gaps: deleted messages, service messages, or IDs that never existed.
                 skipped += 1
-                logger.debug(f"[Backfill:{pair.name}] Skipped ID {msg_id}: {e}")
+                logger.debug(f"[Backfill:{pair_name}] Skipped ID {msg_id}: {e}")
             except Exception as e:
                 failed += 1
-                logger.warning(f"[Backfill:{pair.name}] Failed ID {msg_id}: {e}")
+                logger.warning(f"[Backfill:{pair_name}] Failed ID {msg_id}: {e}")
 
             done = copied + skipped + failed
             if done % 25 == 0 or done == total:
                 try:
                     await application.bot.send_message(
                         notify_chat_id,
-                        f"⏳ <b>{pair.name} backfill progress:</b> {done}/{total} processed "
+                        f"⏳ <b>{pair_name} backfill progress:</b> {done}/{total} processed "
                         f"(✅ {copied} copied, ⏭️ {skipped} skipped, ❌ {failed} failed)",
                         parse_mode="HTML",
                     )
@@ -838,11 +865,11 @@ class TelegramCopierBot:
 
             await asyncio.sleep(random.uniform(2.5, 4.5))
 
-        logger.info(f"[Backfill:{pair.name}] Finished. Copied={copied} Skipped={skipped} Failed={failed}")
+        logger.info(f"[Backfill:{pair_name}] Finished. Copied={copied} Skipped={skipped} Failed={failed}")
         try:
             await application.bot.send_message(
                 notify_chat_id,
-                f"🎉 <b>Backfill complete for {pair.name}!</b>\n\n"
+                f"🎉 <b>Backfill complete for {pair_name}!</b>\n\n"
                 f"✅ Copied: {copied}\n⏭️ Skipped (not found/deleted): {skipped}\n❌ Failed: {failed}",
                 parse_mode="HTML",
             )
@@ -1323,6 +1350,11 @@ class TelegramCopierBot:
                         args.append(str(act_data["gap_minutes"]))
                     context.args = args
                     await self.previewtiming_command(update, context)
+                    return
+
+                elif act_type == "backfill" and act_data.get("source_id") and act_data.get("dest_id"):
+                    context.args = [str(act_data["source_id"]), str(act_data["dest_id"]), str(act_data["start_id"]), str(act_data["end_id"])]
+                    await self.backfill_command(update, context)
                     return
 
                 elif act_type == "backfill" and target_name:
