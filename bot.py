@@ -247,7 +247,7 @@ class TelegramCopierBot:
                 last_states[pair.name] = curr_active
 
     async def pair_worker_loop(self, pair: ChannelPair, application) -> None:
-        """Dedicated worker loop per subject pair applying custom AI prompt instructions, spacing, and reply linking."""
+        """Dedicated worker loop per subject pair applying custom AI prompt instructions, spacing, sanitization, and reply linking."""
         logger.info(f"[Pair: {pair.name}] Worker task started.")
         while True:
             item = await pair.queue.get()
@@ -282,14 +282,18 @@ class TelegramCopierBot:
                     dest_reply_id = db.get_dest_msg_id(pair.name, source_reply_id)
 
                 raw_text = item.get("text", "")
-                if raw_text:
-                    db.save_class_context(pair.name, item["message_id"], raw_text)
+
+                # Perform strict sanitization to strip phone numbers, @usernames, WhatsApp links, and promo text
+                sanitized_text = ai_enhancer.sanitize_text(raw_text)
+
+                if sanitized_text:
+                    db.save_class_context(pair.name, item["message_id"], sanitized_text)
 
                 custom_instruction = db.get_custom_prompt(pair.name)
 
-                if pair.ai_mode != "off" and raw_text:
+                if pair.ai_mode != "off" and sanitized_text:
                     enhanced_text = ai_enhancer.enhance_text_with_gemini(
-                        raw_text, pair.name, pair.ai_mode, custom_instruction=custom_instruction
+                        sanitized_text, pair.name, pair.ai_mode, custom_instruction=custom_instruction
                     )
                     sent_msg = await application.bot.send_message(
                         chat_id=pair.destination_chat_id,
@@ -300,7 +304,7 @@ class TelegramCopierBot:
                         db.save_message_mapping(pair.name, item["message_id"], sent_msg.message_id)
 
                     logger.info(
-                        f"✨ [Pair: {pair.name}] Posted AI-enhanced message #{item['message_id']} to destination chat {pair.destination_chat_id}."
+                        f"✨ [Pair: {pair.name}] Posted AI-sanitized message #{item['message_id']} to chat {pair.destination_chat_id}."
                     )
                 else:
                     if item["type"] == "single":
@@ -314,7 +318,7 @@ class TelegramCopierBot:
                             db.save_message_mapping(pair.name, item["message_id"], copied_msg_id_obj.message_id)
 
                         logger.info(
-                            f"✅ [Pair: {pair.name}] Copied message #{item['message_id']} to destination chat {pair.destination_chat_id}."
+                            f"✅ [Pair: {pair.name}] Copied message #{item['message_id']} to chat {pair.destination_chat_id}."
                         )
                     elif item["type"] == "album":
                         copied_msgs = await application.bot.copy_messages(
@@ -327,7 +331,7 @@ class TelegramCopierBot:
                                 db.save_message_mapping(pair.name, src_id, dst_msg.message_id)
 
                         logger.info(
-                            f"✅ [Pair: {pair.name}] Copied album messages {item['message_ids']} to destination chat {pair.destination_chat_id}."
+                            f"✅ [Pair: {pair.name}] Copied album messages {item['message_ids']} to chat {pair.destination_chat_id}."
                         )
 
                 pair.last_processed_id = max_id
@@ -490,7 +494,7 @@ class TelegramCopierBot:
             await self.handle_discussion_qa(update, context)
             return
 
-        if chat.type == "private" and not message.text.startswith("/"):
+        if chat.type == "private" and message.text and not message.text.startswith("/"):
             await self.handle_admin_conversational_chat(update, context)
             return
 
@@ -500,6 +504,20 @@ class TelegramCopierBot:
 
         msg_text = message.text or message.caption or ""
         reply_to_id = message.reply_to_message.message_id if message.reply_to_message else None
+
+        # Multimodal Vision OCR: If message has a photo, run Vision OCR to extract & sanitize lesson text from image
+        if message.photo and os.getenv("GEMINI_API_KEY"):
+            try:
+                photo_file = await context.bot.get_file(message.photo[-1].file_id)
+                photo_bytes = await photo_file.download_as_bytearray()
+                ocr_text = ai_enhancer.sanitize_and_ocr_image(bytes(photo_bytes))
+                if ocr_text:
+                    msg_text = f"{ocr_text}\n\n{msg_text}".strip()
+            except Exception as e:
+                logger.debug(f"Vision OCR processing note: {e}")
+
+        # Apply strict regex & keyword sanitization
+        sanitized_msg_text = ai_enhancer.sanitize_text(msg_text)
 
         for pair in matching_pairs:
             if not pair.is_active:
@@ -524,7 +542,7 @@ class TelegramCopierBot:
                     pair.pending_albums[mg_id] = {
                         "message_ids": [message.message_id],
                         "job": timer,
-                        "text": msg_text,
+                        "text": sanitized_msg_text,
                         "reply_to_message_id": reply_to_id,
                     }
                 else:
@@ -534,7 +552,7 @@ class TelegramCopierBot:
                     "type": "single",
                     "message_id": message.message_id,
                     "max_id": message.message_id,
-                    "text": msg_text,
+                    "text": sanitized_msg_text,
                     "reply_to_message_id": reply_to_id,
                 })
                 logger.info(
@@ -560,7 +578,8 @@ class TelegramCopierBot:
             f"📊 <b>Current Setup:</b>\n"
             f"• <b>Total Class Channels:</b> {len(self.pairs)}\n"
             f"• 🟢 <b>Active Classes:</b> {active_count}\n"
-            f"• 🧠 <b>Interactive Quizzes:</b> 🟢 Active (`/quiz`)\n"
+            f"• 🛡️ <b>Anonymization & Vision OCR:</b> 🟢 Active\n"
+            f"• 🧠 <b>Practice Quizzes:</b> 🟢 Active (`/quiz`)\n"
             f"• 📖 <b>Weekly Study Guides:</b> 🟢 Active (`/summary`)\n"
             f"• 🤖 <b>AI Engine:</b> {has_ai}\n\n"
             "💬 <b>Chat with me in plain English!</b>\n"
@@ -742,13 +761,15 @@ class TelegramCopierBot:
         """Explanatory guide."""
         msg = (
             "📖 <b>High-Impact AI Features Guide</b>\n\n"
-            "<b>1. Interactive Practice Quizzes (`/quiz`):</b>\n"
+            "<b>1. Automatic Anonymization & Vision OCR:</b>\n"
+            "Strips tutor phone numbers, WhatsApp contacts, @usernames, watermarks, and promo text from both text and image posts!\n\n"
+            "<b>2. Interactive Practice Quizzes (`/quiz`):</b>\n"
             "Generate multiple-choice practice quiz polls directly in class channels!\n"
             "Example: <code>/quiz Chemistry 1</code>\n\n"
-            "<b>2. Weekly Master Study Guide (`/summary`):</b>\n"
+            "<b>3. Weekly Master Study Guide (`/summary`):</b>\n"
             "Generate exam review study guides for students.\n"
             "Example: <code>/summary Biology 1</code>\n\n"
-            "<b>3. Conversational AI Manager:</b>\n"
+            "<b>4. Conversational AI Manager:</b>\n"
             "Type plain messages in chat to configure settings (e.g. <i>'Set Chemistry 1 delay to 180s'</i>)!"
         )
         await update.message.reply_text(msg, parse_mode="HTML")
@@ -772,6 +793,7 @@ class TelegramCopierBot:
             f"• <b>Total Class Channels:</b> {len(self.pairs)}\n"
             f"• 🟢 <b>Active Right Now:</b> {len(active_pairs)}\n"
             f"• 📬 <b>Messages Queued:</b> {total_queued}\n"
+            f"• 🛡️ <b>Anonymization & Vision OCR:</b> 🟢 Enabled\n"
             f"• 🧠 <b>Practice Quizzes:</b> 🟢 Enabled (`/quiz`)\n"
             f"• 📖 <b>Master Study Guides:</b> 🟢 Enabled (`/summary`)\n"
             f"• 🤖 <b>AI Status:</b> {has_ai}\n"

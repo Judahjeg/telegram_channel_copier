@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
+import re
 import time
 import urllib.request
 import urllib.error
@@ -21,6 +23,38 @@ def clean_subject_name(raw_name: str) -> str:
         if name.lower().endswith(suffix):
             name = name[: -len(suffix)].strip()
     return name
+
+
+def sanitize_text(text: str) -> str:
+    """Strictly strip tutor phone numbers, WhatsApp handles, Telegram usernames (@user), URLs, and promo comments."""
+    if not text:
+        return ""
+
+    lines = text.split("\n")
+    cleaned_lines = []
+
+    for line in lines:
+        l_lower = line.lower()
+        # Skip lines that contain promotional contact keywords
+        if any(kw in l_lower for kw in [
+            "whatsapp", "dm me", "message me", "call me", "contact me", "private lesson",
+            "private tutor", "join my channel", "t.me/", "subscribe", "vip group",
+            "for registration", "tuition fee", "payment details"
+        ]):
+            continue
+
+        # Strip phone numbers (e.g. +2348012345678, 08012345678, +1-800-123-4567)
+        line = re.sub(r'\+?\d{1,4}?[-.\s]?\(?\d{1,3}?\)?[-.\s]?\d{1,4}[-.\s]?\d{1,4}[-.\s]?\d{1,9}', '', line)
+        # Strip Telegram @usernames
+        line = re.sub(r'@[a-zA-Z0-9_]{4,}', '', line)
+        # Strip website links
+        line = re.sub(r'https?://\S+', '', line)
+
+        cleaned_lines.append(line)
+
+    result = "\n".join(cleaned_lines)
+    result = re.sub(r'\n\s*\n+', '\n\n', result).strip()
+    return result
 
 
 def call_deepseek_api(prompt_text: str, timeout_sec: int = 15) -> Optional[str]:
@@ -113,50 +147,110 @@ def call_ai_api(prompt_text: str, timeout_sec: int = 15) -> Optional[str]:
     return None
 
 
+def sanitize_and_ocr_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> Optional[str]:
+    """Multimodal Vision OCR: Extract lesson text from image and strip any tutor contact numbers or watermarks printed on the image."""
+    if not GEMINI_API_KEY or not image_bytes:
+        return None
+
+    b64_img = base64.b64encode(image_bytes).decode("utf-8")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": (
+                            "You are an educational content sanitizer. "
+                            "Extract all educational lesson notes, math formulas, or questions written in this image. "
+                            "STRICT REQUIREMENT: Completely REMOVE any tutor phone numbers, WhatsApp contact info, social media handles (@user), "
+                            "watermarks, or promotional text printed on the image. "
+                            "Output ONLY the clean educational content:"
+                        )
+                    },
+                    {
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": b64_img
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            candidates = data.get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if parts:
+                    extracted_text = parts[0].get("text", "").strip()
+                    if extracted_text:
+                        logger.info("[Vision OCR] Extracted & sanitized image text.")
+                        return sanitize_text(extracted_text)
+    except Exception as e:
+        logger.debug(f"[Vision OCR] Exception: {e}")
+
+    return None
+
+
 def enhance_text_with_gemini(
     text: str, subject_name: str, mode: str = "flow", custom_instruction: Optional[str] = None
 ) -> str:
-    """Enhance educational post text using AI according to mode or custom user instructions."""
-    if not text or not text.strip() or mode == "off":
-        return text
+    """Enhance educational post text using AI according to mode or custom user instructions, enforcing strict anonymization."""
+    if not text or not text.strip():
+        return ""
+
+    # Always apply instant regex sanitization first
+    sanitized = sanitize_text(text)
+    if not sanitized or mode == "off":
+        return sanitized
 
     clean_name = clean_subject_name(subject_name)
 
     if custom_instruction and custom_instruction.strip():
         prompt_text = (
-            f"You are an AI master tutor for {clean_name} educational content. "
-            f"Follow these custom user instructions to edit the post text below:\n"
-            f"USER INSTRUCTION: {custom_instruction}\n\n"
-            f"ORIGINAL POST TEXT:\n{text}\n\n"
-            "Output ONLY the final edited post text:"
+            f"You are a strict content anonymizer and AI tutor for {clean_name}. "
+            "Clean the post below. Remove all tutor phone numbers, WhatsApp links, personal @usernames, or promo text. "
+            f"Follow these custom instructions: {custom_instruction}\n\n"
+            f"POST TEXT:\n{sanitized}\n\n"
+            "Output ONLY the final clean educational post text:"
         )
     else:
         prompts = {
             "flow": (
                 f"You are an expert tutor for {clean_name}. "
                 "Polish the following lesson post to make sentences flow smoothly, format key terms in bold, and improve readability. "
-                "DO NOT change facts, formulas, or add extra commentary. Output ONLY the polished text:\n\n"
-                f"{text}"
+                "STRICT REQUIREMENT: Remove any tutor contact numbers, WhatsApp details, or promotional commentary. Output ONLY the polished text:\n\n"
+                f"{sanitized}"
             ),
             "polish": (
                 f"You are an expert tutor for {clean_name}. "
                 "Polish the following lesson post to make sentences flow smoothly, format key terms in bold, and improve readability. "
-                "Output ONLY the polished text:\n\n"
-                f"{text}"
+                "Remove any tutor contact info or links. Output ONLY the polished text:\n\n"
+                f"{sanitized}"
             ),
             "paraphrase": (
                 f"You are a master tutor for {clean_name}. "
                 "Rewrite the following lesson post to make it highly engaging and clear for students. "
-                "Preserve all facts and formulas. Output ONLY the rewritten post:\n\n"
-                f"{text}"
+                "Preserve all facts and formulas. Remove all personal contact numbers or external links. Output ONLY the rewritten post:\n\n"
+                f"{sanitized}"
             ),
             "summarize": (
                 f"You are a study guide generator for {clean_name}. "
-                "Summarize the following post into bullet points. Output ONLY the summary:\n\n"
-                f"{text}"
+                "Summarize the following post into bullet points. Remove any personal tutor contacts. Output ONLY the summary:\n\n"
+                f"{sanitized}"
             ),
             "hashtags": (
-                f"{text}\n\n#{clean_name.replace(' ', '')} #StudyNotes #IconicImpactTutor"
+                f"{sanitized}\n\n#{clean_name.replace(' ', '')} #StudyNotes #IconicImpactTutor"
             ),
         }
 
@@ -167,10 +261,10 @@ def enhance_text_with_gemini(
 
     result = call_ai_api(prompt_text)
     if result:
-        logger.info(f"[AI Enhancer] Enhanced post for {clean_name}.")
-        return result
+        logger.info(f"[AI Enhancer] Enhanced & sanitized post for {clean_name}.")
+        return sanitize_text(result)
 
-    return text
+    return sanitized
 
 
 def answer_student_question(
@@ -181,7 +275,7 @@ def answer_student_question(
 
     context_block = ""
     if class_context_texts:
-        formatted_notes = "\n---\n".join(class_context_texts)
+        formatted_notes = "\n---\n".join([sanitize_text(t) for t in class_context_texts])
         context_block = f"\nCLASS LESSON REFERENCE NOTES:\n{formatted_notes}\n"
 
     prompt_text = (
@@ -198,7 +292,7 @@ def answer_student_question(
     answer = call_ai_api(prompt_text, timeout_sec=15)
     if answer:
         logger.info(f"[AI Q&A] Answered student question for {clean_name}.")
-        return f"🎓 <b>{clean_name} Tutor</b>:\n\n{answer}"
+        return f"🎓 <b>{clean_name} Tutor</b>:\n\n{sanitize_text(answer)}"
 
     return f"🎓 <b>{clean_name} Tutor</b>:\n\nThank you for asking! Let me review the formula and get back to you shortly."
 
@@ -206,7 +300,7 @@ def answer_student_question(
 def generate_class_quiz(subject_name: str, class_context_texts: List[str]) -> Optional[Dict[str, Any]]:
     """Generate an interactive multiple-choice practice quiz payload based on recent class lessons."""
     clean_name = clean_subject_name(subject_name)
-    context_block = "\n".join(class_context_texts) if class_context_texts else "General syllabus concepts"
+    context_block = "\n".join([sanitize_text(t) for t in class_context_texts]) if class_context_texts else "General syllabus concepts"
 
     prompt_text = (
         f"Generate a high-impact multiple choice practice quiz question for '{clean_name}' based on these notes:\n"
@@ -234,7 +328,7 @@ def generate_weekly_summary(subject_name: str, class_context_texts: List[str]) -
     if not class_context_texts:
         return f"📖 <b>{clean_name} Master Study Guide</b>\n\nNo class lesson posts recorded yet for this week."
 
-    context_block = "\n---\n".join(class_context_texts)
+    context_block = "\n---\n".join([sanitize_text(t) for t in class_context_texts])
     prompt_text = (
         f"You are a master study guide author for '{clean_name}'. "
         "Create a comprehensive, beautifully formatted Weekly Exam Review Digest from these lesson notes:\n"
@@ -248,7 +342,7 @@ def generate_weekly_summary(subject_name: str, class_context_texts: List[str]) -
 
     res = call_ai_api(prompt_text, timeout_sec=18)
     if res:
-        return f"📖 <b>{clean_name} Master Weekly Study Guide</b>\n\n{res}"
+        return f"📖 <b>{clean_name} Master Weekly Study Guide</b>\n\n{sanitize_text(res)}"
 
     return f"📖 <b>{clean_name} Master Study Guide</b>\n\nFailed to generate summary. Please try again shortly."
 
