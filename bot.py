@@ -491,6 +491,9 @@ class TelegramCopierBot:
         end_id = pool["end_id"]
         delivered = 0
 
+        skipped_polls = 0
+        skip_samples: List[str] = []
+
         try:
             try:
                 await application.bot.send_message(
@@ -516,6 +519,10 @@ class TelegramCopierBot:
                         db.save_message_mapping(pair_name, cursor_id, result.message_id)
                         delivered += 1
                 except BadRequest as e:
+                    if self._is_poll_copy_restriction(e):
+                        skipped_polls += 1
+                    elif len(skip_samples) < 10:
+                        skip_samples.append(f"#{cursor_id}: {str(e)[:80]}")
                     logger.debug(f"[ScheduledSession:{pair_name}] Skipped ID {cursor_id}: {e}")
                 except Exception as e:
                     logger.warning(f"[ScheduledSession:{pair_name}] Failed ID {cursor_id}: {e}")
@@ -537,16 +544,32 @@ class TelegramCopierBot:
 
             pool_exhausted = cursor_id > end_id
             done_note = " The full backlog is now fully delivered! 🎉" if pool_exhausted else " More continues next scheduled session."
+            poll_note = ""
+            if skipped_polls:
+                poll_note = (
+                    f" ({skipped_polls} quiz poll(s) skipped — Telegram only lets the bot that "
+                    f"created a quiz copy it, so those can't be brought over as-is; use /quiz to "
+                    f"generate fresh ones.)"
+                )
+            samples_note = f"\n\n<code>{chr(10).join(skip_samples)}</code>" if skip_samples else ""
             try:
                 await application.bot.send_message(
                     notify_chat_id,
-                    f"✅ <b>{pair_name}:</b> today's session delivered {delivered} message(s).{done_note}",
+                    f"✅ <b>{pair_name}:</b> today's session delivered {delivered} message(s).{done_note}{poll_note}{samples_note}",
                     parse_mode="HTML",
                 )
             except Exception:
                 pass
         finally:
             self._running_pool_sessions.discard(pair_name)
+
+    @staticmethod
+    def _is_poll_copy_restriction(exc: Exception) -> bool:
+        """Telegram only reveals a quiz poll's correct answer to the bot that originally created
+        it - copying a quiz posted by a different bot/account always fails with a Bad Request,
+        no matter what. Detecting that here turns a silent skip into an explained one."""
+        text = str(exc).lower()
+        return "poll" in text or "quiz" in text
 
     async def _call_with_retry(self, coro_func, max_attempts: int = 4, **kwargs):
         """Call a Telegram Bot API method, transparently retrying on flood-control (RetryAfter)
@@ -958,6 +981,8 @@ class TelegramCopierBot:
         copied = 0
         skipped = 0
         failed = 0
+        skipped_polls = 0
+        skip_samples: List[str] = []
         total = end_id - start_id + 1
 
         logger.info(f"[Backfill:{pair_name}] Starting migration of IDs {start_id}-{end_id} ({total} messages).")
@@ -974,8 +999,13 @@ class TelegramCopierBot:
                     db.save_message_mapping(pair_name, msg_id, result.message_id)
                     copied += 1
             except BadRequest as e:
-                # Expected for gaps: deleted messages, service messages, or IDs that never existed.
+                # Expected for gaps: deleted messages, service messages, or IDs that never existed -
+                # plus quiz polls, which Telegram will never let this bot copy (see below).
                 skipped += 1
+                if self._is_poll_copy_restriction(e):
+                    skipped_polls += 1
+                elif len(skip_samples) < 10:
+                    skip_samples.append(f"#{msg_id}: {str(e)[:80]}")
                 logger.debug(f"[Backfill:{pair_name}] Skipped ID {msg_id}: {e}")
             except Exception as e:
                 failed += 1
@@ -998,11 +1028,24 @@ class TelegramCopierBot:
             await asyncio.sleep(random.uniform(120, 300))
 
         logger.info(f"[Backfill:{pair_name}] Finished. Copied={copied} Skipped={skipped} Failed={failed}")
+
+        poll_note = ""
+        if skipped_polls:
+            poll_note = (
+                f"\n\n📊 <b>{skipped_polls} of those were quiz polls</b> Telegram won't let this bot "
+                f"copy — only the bot that originally created a quiz can see its correct answer, so "
+                f"this is a Telegram platform rule, not something fixable here. If this channel is "
+                f"registered as a class, use <code>/quiz ClassName</code> to generate a fresh AI "
+                f"practice quiz instead."
+            )
+        samples_note = f"\n\n<code>{chr(10).join(skip_samples)}</code>" if skip_samples else ""
+
         try:
             await application.bot.send_message(
                 notify_chat_id,
                 f"🎉 <b>Backfill complete for {pair_name}!</b>\n\n"
-                f"✅ Copied: {copied}\n⏭️ Skipped (not found/deleted): {skipped}\n❌ Failed: {failed}",
+                f"✅ Copied: {copied}\n⏭️ Skipped (not found/deleted/restricted): {skipped}\n❌ Failed: {failed}"
+                f"{poll_note}{samples_note}",
                 parse_mode="HTML",
             )
         except Exception:
@@ -1454,6 +1497,8 @@ class TelegramCopierBot:
         deltas = session.deltas_seconds
         copied = 0
         skipped = 0
+        skipped_polls = 0
+        skip_samples: List[str] = []
         total = len(session.messages)
 
         logger.info(f"[TimedBackfill:{pair_name}] Starting replay of {total} messages.")
@@ -1480,6 +1525,10 @@ class TelegramCopierBot:
                     copied += 1
             except BadRequest as e:
                 skipped += 1
+                if self._is_poll_copy_restriction(e):
+                    skipped_polls += 1
+                elif len(skip_samples) < 10:
+                    skip_samples.append(f"#{msg.id}: {str(e)[:80]}")
                 logger.debug(f"[TimedBackfill:{pair_name}] Skipped ID {msg.id}: {e}")
             except Exception as e:
                 skipped += 1
@@ -1497,10 +1546,18 @@ class TelegramCopierBot:
                     pass
 
         logger.info(f"[TimedBackfill:{pair_name}] Finished. Copied={copied} Skipped={skipped}")
+        poll_note = ""
+        if skipped_polls:
+            poll_note = (
+                f"\n\n📊 <b>{skipped_polls} of those were quiz polls</b> Telegram won't let this bot "
+                f"copy — only the bot that originally created a quiz can see its correct answer. "
+                f"Use <code>/quiz ClassName</code> to generate fresh AI practice quizzes instead."
+            )
+        samples_note = f"\n\n<code>{chr(10).join(skip_samples)}</code>" if skip_samples else ""
         try:
             await application.bot.send_message(
                 notify_chat_id,
-                f"🎉 <b>Timed replay complete!</b>\n\n✅ Copied: {copied}\n⏭️ Skipped: {skipped}",
+                f"🎉 <b>Timed replay complete!</b>\n\n✅ Copied: {copied}\n⏭️ Skipped: {skipped}{poll_note}{samples_note}",
                 parse_mode="HTML",
             )
         except Exception:
