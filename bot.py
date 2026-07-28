@@ -8,12 +8,14 @@ import logging
 import os
 import random
 import re
+import secrets
 import socketserver
 import sys
 import threading
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 from typing import Dict, List, Any, Optional, Set
 
 from telegram import Update, BotCommand
@@ -43,16 +45,81 @@ START_TIME = time.time()
 USERBOT_LOGIN_STATE_FILE = ".login_state"
 
 
+VERIFY_FORM_HTML = """<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connect Account</title></head><body style="font-family:sans-serif;max-width:420px;margin:40px auto;padding:0 16px;">
+<h2>Connect your Telegram account</h2>
+<p>Enter the login code Telegram just sent you. <b>Do not paste this code into any Telegram chat</b> -
+Telegram automatically blocks a code the moment it appears in a message, even one sent to your own bot.</p>
+<form method="GET" action="/verify">
+<input type="hidden" name="token" value="{token}">
+<label>Code:</label><br>
+<input type="text" name="code" style="font-size:1.4em;padding:8px;width:100%;box-sizing:border-box;" autofocus><br><br>
+<label>2FA password (only if you have one enabled):</label><br>
+<input type="password" name="password" style="padding:8px;width:100%;box-sizing:border-box;"><br><br>
+<button type="submit" style="font-size:1.1em;padding:10px 20px;">Connect</button>
+</form>
+{message}
+</body></html>"""
+
+
 def start_dummy_web_server():
-    """Start an immediate HTTP server on PORT for Render's 100% Free Web Service tier."""
+    """Start an immediate HTTP server on PORT for Render's 100% Free Web Service tier.
+    Also serves /verify, a plain web page for completing the userbot login - Telegram
+    auto-invalidates any login code the instant it's typed into a Telegram message, so
+    the code must be entered somewhere outside Telegram entirely."""
     port = int(os.getenv("PORT", "8080"))
 
     class HealthHandler(http.server.SimpleHTTPRequestHandler):
         def do_GET(self):
+            parsed = urllib.parse.urlsplit(self.path)
+            if parsed.path == "/verify":
+                self._handle_verify(parsed)
+                return
+
             self.send_response(200)
             self.send_header("Content-type", "text/plain")
             self.end_headers()
             self.wfile.write(b"Iconic Impact Tutor Bot is running live 24/7!")
+
+        def _handle_verify(self, parsed):
+            qs = urllib.parse.parse_qs(parsed.query)
+            token = qs.get("token", [""])[0]
+            code = qs.get("code", [""])[0]
+            password = qs.get("password", [""])[0] or None
+
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+
+            if not os.path.exists(USERBOT_LOGIN_STATE_FILE):
+                self.wfile.write(b"<h3>No pending login request. Send /userbotlogin +yourphone to the bot first.</h3>")
+                return
+
+            try:
+                with open(USERBOT_LOGIN_STATE_FILE) as f:
+                    state = json.load(f)
+            except Exception:
+                self.wfile.write(b"<h3>Could not read pending login state. Try /userbotlogin again.</h3>")
+                return
+
+            if not token or token != state.get("token"):
+                self.wfile.write(b"<h3>Invalid or expired link. Send /userbotlogin +yourphone to the bot again for a fresh link.</h3>")
+                return
+
+            if not code:
+                html = VERIFY_FORM_HTML.format(token=token, message="")
+                self.wfile.write(html.encode("utf-8"))
+                return
+
+            try:
+                result = asyncio.run(
+                    ub.complete_login(state["phone"], code, state["phone_code_hash"], password=password)
+                )
+                os.remove(USERBOT_LOGIN_STATE_FILE)
+                self.wfile.write(f"<h2>&#9989; {result}</h2><p>You can close this page and go back to Telegram.</p>".encode("utf-8"))
+            except Exception as e:
+                html = VERIFY_FORM_HTML.format(token=token, message=f"<p style='color:red'>Failed: {e}. Try again below.</p>")
+                self.wfile.write(html.encode("utf-8"))
 
         def log_message(self, format, *args):
             pass
@@ -813,49 +880,75 @@ class TelegramCopierBot:
         phone = args[0]
         try:
             phone_code_hash = await ub.request_login_code(phone)
+            token = secrets.token_urlsafe(12)
             with open(USERBOT_LOGIN_STATE_FILE, "w") as f:
-                f.write(f"{phone}\n{phone_code_hash}\n")
-            await update.message.reply_text(
-                f"📲 Login code sent to <b>{phone}</b>! Check Telegram/SMS, then reply with:\n"
-                f"<code>/userbotverify 12345</code>\n\n"
-                f"<i>(Add your 2FA password as a second word if you have one enabled.)</i>",
-                parse_mode="HTML",
-            )
+                json.dump({"phone": phone, "phone_code_hash": phone_code_hash, "token": token}, f)
+
+            render_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+            if render_url:
+                verify_link = f"{render_url}/verify?token={token}"
+                await update.message.reply_text(
+                    f"📲 Login code sent to <b>{phone}</b>!\n\n"
+                    f"⚠️ <b>Do NOT type the code here in Telegram</b> - Telegram automatically blocks a "
+                    f"login code the instant it's typed into any Telegram message, even one sent to this bot.\n\n"
+                    f"Instead, open this link in your phone's browser and enter the code there:\n"
+                    f"{verify_link}",
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+            else:
+                await update.message.reply_text(
+                    f"📲 Login code sent to <b>{phone}</b>!\n\n"
+                    f"⚠️ <b>Do NOT type the code here in Telegram</b> - it will get auto-blocked. "
+                    f"RENDER_EXTERNAL_URL isn't set on the server, so I can't give you a direct link - "
+                    f"set that env var (Render sets it automatically for web services) and try "
+                    f"/userbotlogin again, or complete this via <code>migrate_cli.py login-verify</code> "
+                    f"in a terminal instead.",
+                    parse_mode="HTML",
+                )
         except Exception as e:
             await update.message.reply_text(f"❌ Could not send login code: {e}")
 
     async def userbotverify_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Step 2: complete the userbot login with the code Telegram just sent."""
+        """Deliberately does NOT attempt sign-in from chat: Telegram auto-invalidates any login
+        code the instant it appears in a Telegram message (even one sent to this bot), so trying
+        here would just burn the code. Points to the /verify web page instead, where the code
+        never touches Telegram's messaging layer at all."""
         user = update.effective_user
         if user:
             self.is_user_admin(user.id)
-
-        args = context.args
-        if not args:
-            await update.message.reply_text("ℹ️ Usage: <code>/userbotverify 12345 [2fa_password]</code>", parse_mode="HTML")
-            return
 
         if not os.path.exists(USERBOT_LOGIN_STATE_FILE):
             await update.message.reply_text("❌ No pending login request. Start with <code>/userbotlogin +yourphone</code> first.", parse_mode="HTML")
             return
 
-        code = args[0]
-        password = args[1] if len(args) > 1 else None
-
-        with open(USERBOT_LOGIN_STATE_FILE) as f:
-            phone, phone_code_hash = f.read().splitlines()
-
         try:
-            result = await ub.complete_login(phone, code, phone_code_hash, password=password)
-            os.remove(USERBOT_LOGIN_STATE_FILE)
+            with open(USERBOT_LOGIN_STATE_FILE) as f:
+                state = json.load(f)
+        except Exception:
+            await update.message.reply_text("❌ Could not read the pending login. Try <code>/userbotlogin +yourphone</code> again.", parse_mode="HTML")
+            return
+
+        render_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+        token = state.get("token")
+        if render_url and token:
             await update.message.reply_text(
-                f"✅ <b>{result}</b>\n\nYou can now use /mychannels, /analyzechannel, /previewtiming, and /timedbackfill.",
+                f"⚠️ <b>Don't type your code here in Telegram</b> - Telegram auto-blocks a login code "
+                f"the instant it appears in any Telegram message, even one sent to this bot, and the code "
+                f"gets burned even if you got it right. Use this link in your phone's browser instead:\n\n"
+                f"{render_url}/verify?token={token}",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        else:
+            await update.message.reply_text(
+                "⚠️ Typing your code here will get it auto-blocked by Telegram. RENDER_EXTERNAL_URL "
+                "isn't set on the server, so complete this with "
+                "<code>python migrate_cli.py login-verify &lt;code&gt;</code> in a terminal instead.",
                 parse_mode="HTML",
             )
-        except Exception as e:
-            await update.message.reply_text(f"❌ Login failed: {e}")
 
     async def mychannels_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1587,8 +1680,9 @@ class TelegramCopierBot:
             "New pairs only copy messages posted while the bot is running. To bring over materials "
             "already sitting in an old channel, use <code>/backfill ClassName start_id end_id</code>.\n\n"
             "<b>2c. Replay Old Classes With Their Real Timing:</b>\n"
-            "1. <code>/userbotlogin +yourphone</code> then <code>/userbotverify code</code> (one-time, needs "
-            "TELEGRAM_API_ID/TELEGRAM_API_HASH set on the server).\n"
+            "1. <code>/userbotlogin +yourphone</code> then open the web link it gives you to enter the "
+            "code (never type the code into Telegram itself - it gets auto-blocked). One-time, needs "
+            "TELEGRAM_API_ID/TELEGRAM_API_HASH set on the server.\n"
             "2. <code>/mychannels</code> to find chat IDs, <code>/analyzechannel id</code> to see detected class sessions.\n"
             "3. <code>/previewtiming id session_index</code> to preview the real rhythm, then "
             "<code>/timedbackfill source_id dest_id session_index</code> to replay it for real.\n\n"
@@ -1883,7 +1977,7 @@ class TelegramCopierBot:
             BotCommand("addclass", "Add explicit FROM ➔ TO channel pair"),
             BotCommand("backfill", "Migrate old/existing messages into new channel"),
             BotCommand("userbotlogin", "Connect account to read old channel history"),
-            BotCommand("userbotverify", "Finish connecting with the login code"),
+            BotCommand("userbotverify", "Get the web link to finish connecting"),
             BotCommand("mychannels", "List your channels with chat IDs"),
             BotCommand("analyzechannel", "Test a channel: volume & detected sessions"),
             BotCommand("previewtiming", "Preview a session's real message timing"),

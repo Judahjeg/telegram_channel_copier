@@ -215,8 +215,13 @@ Bot API bots fundamentally cannot do. Two ways to use this:
 Once `TELEGRAM_API_ID`/`TELEGRAM_API_HASH` are set on the server running `bot.py`, just chat with
 your own bot:
 
-1. `/userbotlogin +2348012345678` → Telegram sends you a real login code.
-2. `/userbotverify 12345` (add your 2FA password as a second word if you have one).
+1. `/userbotlogin +2348012345678` → Telegram sends you a real login code, and the bot replies with
+   a web link (`https://your-app.onrender.com/verify?token=...`).
+2. Open that link **in your phone's browser, not Telegram** — and enter the code there. This step
+   can't happen inside a Telegram message at all: Telegram automatically invalidates a login code
+   the instant it detects that code being typed into *any* Telegram chat, even one sent to your own
+   bot, so `/userbotverify <code>` as a chat command is a dead end by design on Telegram's part.
+   The web page is what makes this actually work.
 3. `/mychannels` — lists every channel/group you're in with its exact chat ID.
 4. `/analyzechannel <chat_id>` — message/media volume and how many class "sessions" (contiguous
    bursts separated by big gaps, like overnight) got detected.
