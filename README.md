@@ -185,3 +185,54 @@ The bot uses an SQLite database `copier.db` stored in the working directory. It 
 - When restarted, the bot reads `last_processed_id` from `copier.db`.
 - It ignores any incoming update with `message_id <= last_processed_id`.
 - This guarantees zero duplicate posts and zero skipped posts upon restart.
+
+---
+
+## 🕰️ Migrating Old Channels With Their Real Class Timing (`migrate_cli.py`)
+
+The bot itself (via the Telegram **Bot API**) can only react to messages posted while it's
+running — it cannot read the *content* or *original timestamps* of messages already sitting in
+an old channel from a previous year. `migrate_cli.py` fills that gap using your own Telegram
+account (via [Telethon](https://docs.telethon.dev/)), which *can* read full channel history.
+
+It lets you replay an old class's real message-by-message rhythm (the natural bursts and pauses
+from when the tutor actually taught it) into this year's channel, instead of dumping everything
+at once or on a fake uniform delay — while the actual posting still goes through your bot's
+`copy_message` call, so media is copied cleanly with no re-upload and no "Forwarded from" tag.
+
+### One-time setup
+
+1. Get a free `api_id` / `api_hash` from <https://my.telegram.org> → **API Development Tools**.
+2. Set them as environment variables alongside your existing `BOT_TOKEN`:
+   ```bash
+   export TELEGRAM_API_ID="12345678"
+   export TELEGRAM_API_HASH="your_api_hash_here"
+   ```
+3. Log in once (two steps, since it needs your live Telegram code):
+   ```bash
+   python migrate_cli.py login-request +2348012345678
+   # check Telegram/SMS for the code, then:
+   python migrate_cli.py login-verify 12345
+   ```
+   This creates a local `migration_userbot.session` file that persists the login — **treat it
+   like a password**, it grants full access to your Telegram account. Don't commit it or share it.
+
+### Using it
+
+Run `python migrate_cli.py` with no arguments for an interactive menu (list channels, analyze a
+channel's message/media volume and detected class sessions, preview the real timing of a
+session, dry-run a migration, or run it for real). Every action is also available as a direct
+subcommand (`python migrate_cli.py --help`) for scripting, e.g.:
+
+```bash
+python migrate_cli.py list-channels
+python migrate_cli.py analyze -1001234567890
+python migrate_cli.py preview-timing -1001234567890 --session-index 0
+python migrate_cli.py dry-run -1001234567890 -1009876543210 --session-index 0
+python migrate_cli.py run-backfill -1001234567890 -1009876543210 --session-index 0
+```
+
+Real gaps between messages are replayed as-is (capped at `--max-gap-seconds`, default 20
+minutes, so one long real-life pause doesn't stall the whole replay). Runs are resume-safe: if
+interrupted, re-running the same `run-backfill` command skips messages already migrated for
+that pair name.

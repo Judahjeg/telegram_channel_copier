@@ -1,0 +1,202 @@
+from __future__ import annotations
+
+import datetime
+import os
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict, Any
+
+from telethon import TelegramClient
+from telethon.tl.types import Channel, Chat, User
+
+SESSION_NAME = os.getenv("USERBOT_SESSION_NAME", "migration_userbot")
+
+
+def get_client() -> TelegramClient:
+    """Build a Telethon client from TELEGRAM_API_ID / TELEGRAM_API_HASH.
+    Get these once (free) from https://my.telegram.org -> API Development Tools.
+    The session file (SESSION_NAME.session) persists the login after the first
+    successful sign-in, so this only needs to happen once per machine."""
+    api_id = os.getenv("TELEGRAM_API_ID")
+    api_hash = os.getenv("TELEGRAM_API_HASH")
+    if not api_id or not api_hash:
+        raise RuntimeError(
+            "TELEGRAM_API_ID and TELEGRAM_API_HASH environment variables are required. "
+            "Get them for free from https://my.telegram.org -> 'API Development Tools'."
+        )
+    return TelegramClient(SESSION_NAME, int(api_id), api_hash)
+
+
+async def request_login_code(phone: str) -> str:
+    """Step 1 of login: sends a Telegram login code to the account and returns a
+    phone_code_hash needed to complete sign-in. Safe to call from a short-lived script."""
+    client = get_client()
+    await client.connect()
+    try:
+        sent = await client.send_code_request(phone)
+        return sent.phone_code_hash
+    finally:
+        await client.disconnect()
+
+
+async def complete_login(phone: str, code: str, phone_code_hash: str, password: Optional[str] = None) -> str:
+    """Step 2 of login: verifies the code (and 2FA password if enabled) and persists the session."""
+    client = get_client()
+    await client.connect()
+    try:
+        try:
+            await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
+        except Exception as e:
+            if password and "password" in str(e).lower() or "SessionPasswordNeeded" in type(e).__name__:
+                await client.sign_in(password=password)
+            else:
+                raise
+        me = await client.get_me()
+        return f"Logged in as {me.first_name} (@{me.username or me.id})"
+    finally:
+        await client.disconnect()
+
+
+async def is_logged_in() -> bool:
+    client = get_client()
+    await client.connect()
+    try:
+        return await client.is_user_authorized()
+    finally:
+        await client.disconnect()
+
+
+@dataclass
+class DialogInfo:
+    id: int
+    title: str
+    kind: str  # "channel", "group", "user"
+    username: Optional[str] = None
+
+
+async def list_channels() -> List[DialogInfo]:
+    """List every channel/group/chat the logged-in account can see, with the exact
+    chat_id needed to configure a pair in the bot (avoids the @RawDataBot dance)."""
+    client = get_client()
+    await client.start()
+    try:
+        results = []
+        async for dialog in client.iter_dialogs():
+            entity = dialog.entity
+            if isinstance(entity, Channel):
+                kind = "channel" if entity.broadcast else "supergroup"
+            elif isinstance(entity, Chat):
+                kind = "group"
+            elif isinstance(entity, User):
+                continue
+            else:
+                kind = "unknown"
+            results.append(DialogInfo(
+                id=dialog.id,
+                title=dialog.title or "(untitled)",
+                kind=kind,
+                username=getattr(entity, "username", None),
+            ))
+        return results
+    finally:
+        await client.disconnect()
+
+
+@dataclass
+class MessageMeta:
+    id: int
+    date: datetime.datetime
+    has_media: bool
+    text_len: int
+
+
+@dataclass
+class Session:
+    """A contiguous cluster of messages (one 'class') separated from the next
+    cluster by a gap bigger than gap_minutes."""
+    start_date: datetime.datetime
+    end_date: datetime.datetime
+    messages: List[MessageMeta] = field(default_factory=list)
+
+    @property
+    def deltas_seconds(self) -> List[float]:
+        """Seconds between each message and the one before it (0.0 for the first)."""
+        out = [0.0]
+        for prev, cur in zip(self.messages, self.messages[1:]):
+            out.append((cur.date - prev.date).total_seconds())
+        return out
+
+    @property
+    def duration_seconds(self) -> float:
+        return (self.end_date - self.start_date).total_seconds()
+
+
+async def fetch_channel_history(channel_id: int, limit: Optional[int] = None) -> List[MessageMeta]:
+    """Pull every message's real timestamp + media flag from a channel. This is the
+    thing a Bot API bot fundamentally cannot do for historical messages - Telethon
+    (a real user session) can, because it's just reading a channel it's a member of."""
+    client = get_client()
+    await client.start()
+    try:
+        out = []
+        async for msg in client.iter_messages(channel_id, limit=limit, reverse=True):
+            if msg is None:
+                continue
+            has_media = bool(msg.media) and not getattr(msg, "web_preview", None)
+            text_len = len(msg.raw_text or "")
+            out.append(MessageMeta(id=msg.id, date=msg.date, has_media=has_media, text_len=text_len))
+        return out
+    finally:
+        await client.disconnect()
+
+
+def group_into_sessions(messages: List[MessageMeta], gap_minutes: float = 90.0) -> List[Session]:
+    """Split a flat message list into class sessions wherever the gap between two
+    consecutive messages exceeds gap_minutes (e.g. the overnight gap between days)."""
+    if not messages:
+        return []
+
+    gap = datetime.timedelta(minutes=gap_minutes)
+    sessions: List[Session] = []
+    current = Session(start_date=messages[0].date, end_date=messages[0].date, messages=[messages[0]])
+
+    for prev, cur in zip(messages, messages[1:]):
+        if cur.date - prev.date > gap:
+            current.end_date = prev.date
+            sessions.append(current)
+            current = Session(start_date=cur.date, end_date=cur.date, messages=[cur])
+        else:
+            current.messages.append(cur)
+
+    current.end_date = current.messages[-1].date
+    sessions.append(current)
+    return sessions
+
+
+def analyze_channel(messages: List[MessageMeta], gap_minutes: float = 90.0) -> Dict[str, Any]:
+    """Quick stats used by the 'analyze/test a channel' CLI action before committing to a migration."""
+    if not messages:
+        return {"message_count": 0, "sessions": []}
+
+    sessions = group_into_sessions(messages, gap_minutes=gap_minutes)
+    media_count = sum(1 for m in messages if m.has_media)
+    total_text_chars = sum(m.text_len for m in messages)
+
+    session_summaries = []
+    for s in sessions:
+        session_summaries.append({
+            "start": s.start_date.isoformat(),
+            "end": s.end_date.isoformat(),
+            "message_count": len(s.messages),
+            "media_count": sum(1 for m in s.messages if m.has_media),
+            "duration_minutes": round(s.duration_seconds / 60, 1),
+        })
+
+    return {
+        "message_count": len(messages),
+        "date_range": (messages[0].date.isoformat(), messages[-1].date.isoformat()),
+        "media_count": media_count,
+        "total_text_chars": total_text_chars,
+        "estimated_tokens": round(total_text_chars / 4),
+        "session_count": len(sessions),
+        "sessions": session_summaries,
+    }
