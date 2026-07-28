@@ -380,7 +380,7 @@ def generate_weekly_summary(subject_name: str, class_context_texts: List[str]) -
 def process_admin_conversational_assistant(
     user_message: str, class_pairs_summary: str, is_admin: bool
 ) -> str:
-    """Fully Conversational AI Manager Co-Pilot that understands natural English and emits structured execution actions."""
+    """Fully Conversational AI Manager Co-Pilot that understands natural English, adds/deletes custom classes, and emits structured execution actions."""
     if not is_admin:
         return "⛔ <b>Access Denied:</b> Only authorized bot administrators can manage bot settings."
 
@@ -391,14 +391,15 @@ def process_admin_conversational_assistant(
         "CURRENT BOT CONFIGURATION & CLASSES:\n"
         f"{class_pairs_summary}\n\n"
         "INSTRUCTION PARSING INSTRUCTIONS:\n"
-        "If the administrator asks you to perform an action or change a setting (e.g., activating a class, turning off a class, changing delays, setting custom AI prompt instructions, generating a quiz, or showing logs), respond conversationally AND append a hidden execution tag at the very end of your response:\n"
-        "- `<ACTION>{\"type\": \"activate\", \"class\": \"<Class_Name>\", \"value\": true}</ACTION>`\n"
-        "- `<ACTION>{\"type\": \"activate\", \"class\": \"<Class_Name>\", \"value\": false}</ACTION>`\n"
-        "- `<ACTION>{\"type\": \"setdelay\", \"class\": \"<Class_Name>\", \"value\": <seconds>}</ACTION>`\n"
-        "- `<ACTION>{\"type\": \"setprompt\", \"class\": \"<Class_Name>\", \"value\": \"<custom_prompt_text>\"}</ACTION>`\n"
-        "- `<ACTION>{\"type\": \"quiz\", \"class\": \"<Class_Name>\"}</ACTION>`\n"
-        "- `<ACTION>{\"type\": \"summary\", \"class\": \"<Class_Name>\"}</ACTION>`\n"
-        "- `<ACTION>{\"type\": \"logs\"}</ACTION>`\n\n"
+        "If the administrator asks you to perform an action or change a setting, respond conversationally AND append a hidden execution tag at the very end of your response:\n"
+        "- Add/create class: `<ACTION>{\"type\": \"addclass\", \"name\": \"<Class_Name>\", \"source_chat_id\": <int>, \"destination_chat_id\": <int>, \"discussion_chat_id\": <int_or_null>}</ACTION>`\n"
+        "- Delete/remove class: `<ACTION>{\"type\": \"deleteclass\", \"name\": \"<Class_Name>\"}</ACTION>`\n"
+        "- Activate class: `<ACTION>{\"type\": \"activate\", \"class\": \"<Class_Name>\", \"value\": true}</ACTION>`\n"
+        "- Pause class: `<ACTION>{\"type\": \"activate\", \"class\": \"<Class_Name>\", \"value\": false}</ACTION>`\n"
+        "- Change delay: `<ACTION>{\"type\": \"setdelay\", \"class\": \"<Class_Name>\", \"value\": <seconds>}</ACTION>`\n"
+        "- Custom AI prompt: `<ACTION>{\"type\": \"setprompt\", \"class\": \"<Class_Name>\", \"value\": \"<custom_prompt_text>\"}</ACTION>`\n"
+        "- Generate quiz: `<ACTION>{\"type\": \"quiz\", \"class\": \"<Class_Name>\"}</ACTION>`\n"
+        "- Show student logs: `<ACTION>{\"type\": \"logs\"}</ACTION>`\n\n"
         f"ADMINISTRATOR MESSAGE: {user_message}\n\n"
         "CONVERSATIONAL CO-PILOT RESPONSE:"
     )
@@ -408,6 +409,6 @@ def process_admin_conversational_assistant(
         return result
 
     return (
-        "🧙‍♂️ <b>AI Manager Co-Pilot</b>: I am here to help you manage your bot! "
-        "Chat with me naturally about any class setup, delays, custom prompts, or logs."
+        "🧙‍♂️ <b>AI Manager Co-Pilot</b>: I am here to help you set up and manage your classes! "
+        "Tell me what class you'd like to add or remove, or use `/addclass ClassName source_id dest_id discussion_id`."
     )

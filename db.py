@@ -64,7 +64,89 @@ def init_db(db_path: str = DB_FILE) -> None:
             )
             """
         )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dynamic_classes (
+                name TEXT PRIMARY KEY,
+                source_chat_id INTEGER NOT NULL,
+                destination_chat_id INTEGER NOT NULL,
+                discussion_chat_id INTEGER,
+                delay_min_seconds REAL DEFAULT 120.0,
+                delay_max_seconds REAL DEFAULT 240.0,
+                ai_mode TEXT DEFAULT 'flow',
+                start_message_id INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
         conn.commit()
+
+
+def save_dynamic_class(
+    name: str,
+    source_chat_id: int,
+    destination_chat_id: int,
+    discussion_chat_id: Optional[int] = None,
+    delay_min_seconds: float = 120.0,
+    delay_max_seconds: float = 240.0,
+    ai_mode: str = "flow",
+    db_path: str = DB_FILE,
+) -> None:
+    """Save or update a dynamic class configuration in SQLite database."""
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO dynamic_classes (name, source_chat_id, destination_chat_id, discussion_chat_id, delay_min_seconds, delay_max_seconds, ai_mode, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                source_chat_id = excluded.source_chat_id,
+                destination_chat_id = excluded.destination_chat_id,
+                discussion_chat_id = excluded.discussion_chat_id,
+                delay_min_seconds = excluded.delay_min_seconds,
+                delay_max_seconds = excluded.delay_max_seconds,
+                ai_mode = excluded.ai_mode,
+                created_at = excluded.created_at
+            """,
+            (name, source_chat_id, destination_chat_id, discussion_chat_id, delay_min_seconds, delay_max_seconds, ai_mode, now_iso),
+        )
+        conn.commit()
+
+
+def get_all_dynamic_classes(db_path: str = DB_FILE) -> List[Dict[str, Any]]:
+    """Retrieve all dynamic classes configured in SQLite database."""
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT name, source_chat_id, destination_chat_id, discussion_chat_id, delay_min_seconds, delay_max_seconds, ai_mode, start_message_id
+            FROM dynamic_classes
+            """
+        )
+        rows = cursor.fetchall()
+        classes = []
+        for r in rows:
+            classes.append({
+                "name": r[0],
+                "source_chat_id": r[1],
+                "destination_chat_id": r[2],
+                "discussion_chat_id": r[3],
+                "delay_min_seconds": r[4],
+                "delay_max_seconds": r[5],
+                "ai_mode": r[6],
+                "start_message_id": r[7],
+            })
+        return classes
+
+
+def delete_dynamic_class(name: str, db_path: str = DB_FILE) -> bool:
+    """Delete a dynamic class configuration from SQLite database."""
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM dynamic_classes WHERE LOWER(name) = LOWER(?)", (name,))
+        conn.commit()
+        return cursor.rowcount > 0
 
 
 def get_last_processed_id(pair_name: str, db_path: str = DB_FILE) -> Optional[int]:

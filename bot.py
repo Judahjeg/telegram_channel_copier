@@ -75,9 +75,9 @@ def parse_iso_datetime(dt_str: str) -> datetime.datetime:
 class ChannelPair:
     def __init__(self, config: Dict[str, Any]):
         self.name: str = config["name"]
-        self.source_chat_id: int = config["source_chat_id"]
-        self.destination_chat_id: int = config["destination_chat_id"]
-        self.discussion_chat_id: Optional[int] = config.get("discussion_chat_id", None)
+        self.source_chat_id: int = int(config["source_chat_id"])
+        self.destination_chat_id: int = int(config["destination_chat_id"])
+        self.discussion_chat_id: Optional[int] = int(config["discussion_chat_id"]) if config.get("discussion_chat_id") else None
         self.start_message_id: int = config.get("start_message_id", 1)
 
         # Message Spacing / Delay settings (in seconds)
@@ -160,31 +160,55 @@ class TelegramCopierBot:
         self.source_map: Dict[int, List[ChannelPair]] = {}
         self.discussion_map: Dict[int, ChannelPair] = {}
         self.admin_user_ids: Set[int] = set()
+        self.application = None
 
-    def load_config(self) -> None:
-        """Load channel pairs and admin user IDs from config.json and environment."""
-        if not os.path.exists(self.config_path):
-            logger.error(f"Configuration file '{self.config_path}' not found!")
-            sys.exit(1)
+    def sync_classes_from_db(self) -> None:
+        """Load and synchronize dynamic class configurations from SQLite database into memory maps."""
+        db_classes = db.get_all_dynamic_classes()
 
-        with open(self.config_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        if not db_classes and os.path.exists(self.config_path):
+            try:
+                with open(self.config_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                pairs_config = data if isinstance(data, list) else data.get("pairs", [])
+                for p_cfg in pairs_config:
+                    db.save_dynamic_class(
+                        name=p_cfg["name"],
+                        source_chat_id=int(p_cfg["source_chat_id"]),
+                        destination_chat_id=int(p_cfg["destination_chat_id"]),
+                        discussion_chat_id=int(p_cfg["discussion_chat_id"]) if p_cfg.get("discussion_chat_id") else None,
+                        delay_min_seconds=float(p_cfg.get("delay_min_seconds", 120.0)),
+                        delay_max_seconds=float(p_cfg.get("delay_max_seconds", 240.0)),
+                        ai_mode=p_cfg.get("ai_mode", "flow"),
+                    )
+                db_classes = db.get_all_dynamic_classes()
+                logger.info(f"Seeded {len(db_classes)} initial classes from config.json into SQLite database.")
+            except Exception as e:
+                logger.error(f"Error seeding config.json to DB: {e}")
 
-        pairs_config = data if isinstance(data, list) else data.get("pairs", [])
-        raw_admins = [] if isinstance(data, list) else data.get("admin_user_ids", [])
+        # Re-build memory maps
+        self.source_map.clear()
+        self.discussion_map.clear()
 
-        env_admins = os.getenv("ADMIN_IDS", "")
-        if env_admins:
-            for aid in env_admins.split(","):
-                aid = aid.strip()
-                if aid.isdigit():
-                    raw_admins.append(int(aid))
+        existing_pairs_by_name = {p.name.lower(): p for p in self.pairs}
+        new_pairs = []
 
-        self.admin_user_ids = set(raw_admins)
+        for p_cfg in db_classes:
+            p_name = p_cfg["name"]
+            if p_name.lower() in existing_pairs_by_name:
+                pair = existing_pairs_by_name[p_name.lower()]
+                pair.source_chat_id = int(p_cfg["source_chat_id"])
+                pair.destination_chat_id = int(p_cfg["destination_chat_id"])
+                pair.discussion_chat_id = int(p_cfg["discussion_chat_id"]) if p_cfg.get("discussion_chat_id") else None
+                pair.delay_min_seconds = float(p_cfg.get("delay_min_seconds", 120.0))
+                pair.delay_max_seconds = float(p_cfg.get("delay_max_seconds", 240.0))
+                pair.ai_mode = p_cfg.get("ai_mode", "flow")
+            else:
+                pair = ChannelPair(p_cfg)
+                if self.application:
+                    pair.worker_task = asyncio.create_task(self.pair_worker_loop(pair, self.application))
 
-        for p_cfg in pairs_config:
-            pair = ChannelPair(p_cfg)
-            self.pairs.append(pair)
+            new_pairs.append(pair)
 
             if pair.source_chat_id not in self.source_map:
                 self.source_map[pair.source_chat_id] = []
@@ -195,10 +219,30 @@ class TelegramCopierBot:
 
             self.discussion_map[pair.destination_chat_id] = pair
 
+        self.pairs = new_pairs
+        logger.info(f"Synchronized {len(self.pairs)} dynamic classes in memory.")
+
+    def load_config(self) -> None:
+        """Load admin user IDs and dynamic class channels."""
+        raw_admins = []
+        if os.path.exists(self.config_path):
+            with open(self.config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            raw_admins = [] if isinstance(data, list) else data.get("admin_user_ids", [])
+
+        env_admins = os.getenv("ADMIN_IDS", "")
+        if env_admins:
+            for aid in env_admins.split(","):
+                aid = aid.strip()
+                if aid.isdigit():
+                    raw_admins.append(int(aid))
+
+        self.admin_user_ids = set(raw_admins)
+        self.sync_classes_from_db()
         logger.info(f"Loaded {len(self.pairs)} channel pairs and {len(self.admin_user_ids)} bot admins.")
 
     def find_pair_by_name(self, search_term: str) -> Optional[ChannelPair]:
-        """Flexible name lookup supporting exact match and partial fuzzy match (e.g. 'chemistry 1' or 'chem 1')."""
+        """Flexible name lookup supporting exact match and partial fuzzy match."""
         term = search_term.strip().lower()
         if not term:
             return None
@@ -230,7 +274,7 @@ class TelegramCopierBot:
         for p in self.pairs:
             cp = db.get_custom_prompt(p.name)
             cp_str = f"Prompt: '{cp}'" if cp else "Prompt: default"
-            lines.append(f"- Class: {p.name} | Spacing: {p.delay_min_seconds:.0f}s | Active: {p.is_active} | {cp_str}")
+            lines.append(f"- Class: {p.name} | Source: {p.source_chat_id} | Dest: {p.destination_chat_id} | Discussion: {p.discussion_chat_id} | Spacing: {p.delay_min_seconds:.0f}s | Active: {p.is_active} | {cp_str}")
         return "\n".join(lines)
 
     async def activation_checker_loop(self) -> None:
@@ -419,10 +463,83 @@ class TelegramCopierBot:
 
         await message.reply_text(ai_response, parse_mode="HTML")
 
+    async def addclass_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Interactively add or update a custom class channel directly via Telegram command."""
+        user = update.effective_user
+        if user and not self.is_user_admin(user.id):
+            await update.message.reply_text("⛔ <b>Access Denied:</b> Only authorized bot admins can add class channels.", parse_mode="HTML")
+            return
+
+        args = context.args
+        if not args or len(args) < 3:
+            await update.message.reply_text(
+                "➕ <b>How to Add/Set a Custom Class Channel:</b>\n\n"
+                "Syntax: <code>/addclass ClassName SourceChatID DestinationChatID [DiscussionChatID]</code>\n\n"
+                "<b>Example:</b>\n"
+                "<code>/addclass Mathematics 1 -100123456789 -100987654321 -100555444333</code>\n\n"
+                "<i>Tip: You can also just tell the AI in private chat: 'Add a new class called Mathematics 1 with source -100123... and dest -100987...'</i>",
+                parse_mode="HTML",
+            )
+            return
+
+        c_name = args[0]
+        arg_offset = 1
+        if len(args) >= 4 and not args[1].lstrip("-").isdigit():
+            c_name = f"{args[0]} {args[1]}"
+            arg_offset = 2
+
+        try:
+            source_id = int(args[arg_offset])
+            dest_id = int(args[arg_offset + 1])
+            disc_id = int(args[arg_offset + 2]) if len(args) > arg_offset + 2 else None
+
+            db.save_dynamic_class(
+                name=c_name,
+                source_chat_id=source_id,
+                destination_chat_id=dest_id,
+                discussion_chat_id=disc_id,
+            )
+            self.sync_classes_from_db()
+
+            disc_str = f" | Discussion: <code>{disc_id}</code>" if disc_id else ""
+            await update.message.reply_text(
+                f"🎉 <b>Success!</b> Class channel <b>{c_name}</b> has been set up!\n\n"
+                f"• Source ID: <code>{source_id}</code>\n"
+                f"• Destination ID: <code>{dest_id}</code>{disc_str}\n"
+                f"• Status: 🟢 Active and listening now!",
+                parse_mode="HTML",
+            )
+        except ValueError:
+            await update.message.reply_text("❌ Source, Destination, and Discussion Chat IDs must be valid numeric IDs (e.g., -100123456789).")
+
+    async def deleteclass_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Interactively delete a class channel configuration."""
+        user = update.effective_user
+        if user and not self.is_user_admin(user.id):
+            await update.message.reply_text("⛔ <b>Access Denied:</b> Only authorized bot admins can delete class channels.", parse_mode="HTML")
+            return
+
+        args = context.args
+        if not args:
+            await update.message.reply_text("🗑️ <b>Usage:</b> <code>/deleteclass ClassName</code>\nExample: <code>/deleteclass Physics 1</code>", parse_mode="HTML")
+            return
+
+        target_name = " ".join(args).strip()
+        deleted = db.delete_dynamic_class(target_name)
+        if deleted:
+            self.sync_classes_from_db()
+            await update.message.reply_text(f"🗑️ <b>Deleted!</b> Class channel <b>{target_name}</b> was removed successfully.", parse_mode="HTML")
+        else:
+            await update.message.reply_text(f"❌ Class <b>{target_name}</b> not found.", parse_mode="HTML")
+
     async def handle_admin_conversational_chat(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Conversational AI Manager Co-Pilot Handler: Understands natural English and executes actions via JSON action tags."""
+        """Conversational AI Manager Co-Pilot Handler: Understands natural English, adds/deletes custom classes, and executes actions."""
         message = update.effective_message
         user = update.effective_user
 
@@ -446,10 +563,23 @@ class TelegramCopierBot:
             try:
                 act_data = json.loads(act_str.strip())
                 act_type = act_data.get("type")
-                target_name = act_data.get("class")
+                target_name = act_data.get("name") or act_data.get("class")
                 target_pair = self.find_pair_by_name(target_name) if target_name else None
 
-                if act_type == "activate" and target_pair:
+                if act_type == "addclass" and target_name:
+                    s_id = int(act_data["source_chat_id"])
+                    d_id = int(act_data["destination_chat_id"])
+                    disc_id = int(act_data["discussion_chat_id"]) if act_data.get("discussion_chat_id") else None
+                    db.save_dynamic_class(name=target_name, source_chat_id=s_id, destination_chat_id=d_id, discussion_chat_id=disc_id)
+                    self.sync_classes_from_db()
+                    logger.info(f"Conversational AI created class {target_name}")
+
+                elif act_type == "deleteclass" and target_name:
+                    db.delete_dynamic_class(target_name)
+                    self.sync_classes_from_db()
+                    logger.info(f"Conversational AI deleted class {target_name}")
+
+                elif act_type == "activate" and target_pair:
                     target_pair.manual_override_active = bool(act_data.get("value", True))
                     logger.info(f"Conversational AI executed activate for {target_pair.name}: {target_pair.manual_override_active}")
 
@@ -457,6 +587,14 @@ class TelegramCopierBot:
                     val = float(act_data.get("value", 180))
                     target_pair.delay_min_seconds = val
                     target_pair.delay_max_seconds = val
+                    db.save_dynamic_class(
+                        name=target_pair.name,
+                        source_chat_id=target_pair.source_chat_id,
+                        destination_chat_id=target_pair.destination_chat_id,
+                        discussion_chat_id=target_pair.discussion_chat_id,
+                        delay_min_seconds=val,
+                        delay_max_seconds=val,
+                    )
                     logger.info(f"Conversational AI executed setdelay for {target_pair.name}: {val}s")
 
                 elif act_type == "setprompt" and target_pair:
@@ -579,21 +717,24 @@ class TelegramCopierBot:
         msg = (
             f"🧙‍♂️ <b>Welcome to Iconic Impact Tutor AI Co-Pilot, {user.first_name if user else 'User'}!</b>\n\n"
             f"Your Telegram User ID: <code>{user.id if user else 'Unknown'}</code>\n\n"
-            "I am your Conversational AI Manager Assistant! You can chat with me naturally in plain English about anything—turn off a class, change AI prompts, dictate message delays, or ask how to set up.\n\n"
+            "I am your Conversational AI Manager Assistant! You have <b>100% full flexibility</b> to set up any class channels you want directly via chat or commands!\n\n"
             f"📍 <b>Where Bot is Currently Added & Active:</b>\n"
             f"{locations_block}\n\n"
             f"📊 <b>Bot Overview:</b>\n"
             f"• <b>Total Connected Classes:</b> {len(self.pairs)}\n"
             f"• 🟢 <b>Active Right Now:</b> {active_count}\n"
+            f"• 🛠️ <b>Dynamic Class Setup:</b> 🟢 Active (`/addclass` & `/deleteclass`)\n"
             f"• 💬 <b>Conversational AI Co-Pilot:</b> 🟢 Active\n"
             f"• 📜 <b>Student Interaction Logs:</b> 🟢 Active (`/logs`)\n"
             f"• 🤖 <b>AI Engine:</b> {has_ai}\n\n"
-            "💬 <b>Chat with me naturally!</b>\n"
-            "• <i>'Hey bot, turn off Chemistry 1 for today'</i>\n"
-            "• <i>'Make Biology 1 posts short and simple'</i>\n"
-            "• <i>'Set Physics spacing to 3 minutes'</i>\n"
-            "• <i>'Show me the student logs'</i>\n\n"
+            "💬 <b>Chat with me naturally or run commands:</b>\n"
+            "• <i>'Add a class called Further Maths with source -100123 and dest -100456'</i>\n"
+            "• <code>/addclass Maths 1 -100123456789 -100987654321</code>\n"
+            "• <code>/deleteclass Physics 1</code>\n"
+            "• <i>'Show student logs'</i>\n\n"
             "👇 <b>Quick Commands Menu:</b>\n"
+            "• /addclass - Add/Set up a new custom class channel\n"
+            "• /deleteclass - Delete a class channel\n"
             "• /logs - View recent student Q&A interaction logs\n"
             "• /schedule - View & manage weekly class timetables\n"
             "• /quiz - Generate interactive quiz for a class\n"
@@ -754,7 +895,7 @@ class TelegramCopierBot:
         found_pair = self.find_pair_by_name(search_query)
 
         if not found_pair:
-            await update.message.reply_text(f"❌ Class channel '<b>{search_query}</b>' not found in config.json.", parse_mode="HTML")
+            await update.message.reply_text(f"❌ Class channel '<b>{search_query}</b>' not found.", parse_mode="HTML")
             return
 
         instruction_text = " ".join(args[instruction_start_idx:]).strip()
@@ -791,12 +932,15 @@ class TelegramCopierBot:
     ) -> None:
         """Explanatory guide."""
         msg = (
-            "📖 <b>Conversational AI Co-Pilot Guide</b>\n\n"
-            "<b>Chat naturally with the bot about anything:</b>\n"
-            "• <i>'Hey bot, turn off Chemistry 1 for today'</i>\n"
-            "• <i>'Make Biology 1 posts short and simple'</i>\n"
-            "• <i>'Set Physics delay to 3 minutes'</i>\n"
-            "• <i>'Show me the student logs'</i>"
+            "📖 <b>Dynamic Class Setup & Conversational AI Guide</b>\n\n"
+            "<b>1. Add / Set Up Any Class Channel:</b>\n"
+            "Tell the AI in chat or use <code>/addclass ClassName source_id dest_id [discussion_id]</code>\n\n"
+            "<b>2. Delete Any Class Channel:</b>\n"
+            "Tell the AI in chat or use <code>/deleteclass ClassName</code>\n\n"
+            "<b>3. Priority Lesson Notes Search:</b>\n"
+            "AI tutor scans class channel notes first before external knowledge.\n\n"
+            "<b>4. Student Interaction Logs (`/logs`):</b>\n"
+            "View recent student questions and AI answers."
         )
         await update.message.reply_text(msg, parse_mode="HTML")
 
@@ -819,6 +963,7 @@ class TelegramCopierBot:
             f"• <b>Total Class Channels:</b> {len(self.pairs)}\n"
             f"• 🟢 <b>Active Right Now:</b> {len(active_pairs)}\n"
             f"• 📬 <b>Messages Queued:</b> {total_queued}\n"
+            f"• 🛠️ <b>Dynamic Class Setup:</b> 🟢 Enabled (`/addclass` & `/deleteclass`)\n"
             f"• 💬 <b>Conversational AI Co-Pilot:</b> 🟢 Enabled\n"
             f"• 🛡️ <b>Anonymization & Vision OCR:</b> 🟢 Enabled\n"
             f"• 📜 <b>Student Interaction Logs:</b> 🟢 Enabled (`/logs`)\n"
@@ -833,7 +978,7 @@ class TelegramCopierBot:
     ) -> None:
         """Detailed status of all subject pairs."""
         if not self.pairs:
-            await update.message.reply_text("No channel pairs configured.")
+            await update.message.reply_text("No channel pairs configured. Use `/addclass ClassName source_id dest_id` to add one!", parse_mode="HTML")
             return
 
         lines = ["📚 <b>Exact Class Channels, Locations & Spacing:</b>\n"]
@@ -983,6 +1128,14 @@ class TelegramCopierBot:
 
         found_pair.delay_min_seconds = min_sec
         found_pair.delay_max_seconds = max_sec
+        db.save_dynamic_class(
+            name=found_pair.name,
+            source_chat_id=found_pair.source_chat_id,
+            destination_chat_id=found_pair.destination_chat_id,
+            discussion_chat_id=found_pair.discussion_chat_id,
+            delay_min_seconds=min_sec,
+            delay_max_seconds=max_sec,
+        )
 
         if min_sec == max_sec:
             fmt_desc = f"<b>{min_sec:.0f} seconds</b> ({min_sec/60:.1f} minutes)"
@@ -1066,8 +1219,12 @@ class TelegramCopierBot:
 
     async def post_init(self, application) -> None:
         """Start worker loops, scheduler, and register bot commands menu."""
+        self.application = application
+
         commands = [
             BotCommand("start", "Location overview & AI setup wizard"),
+            BotCommand("addclass", "Add/set up a new custom class channel"),
+            BotCommand("deleteclass", "Delete a class channel"),
             BotCommand("logs", "View student Q&A interaction logs"),
             BotCommand("quiz", "Generate interactive practice quiz poll"),
             BotCommand("summary", "Generate weekly master study guide"),
@@ -1106,6 +1263,8 @@ class TelegramCopierBot:
 
         application.add_handler(CommandHandler("start", self.start_command))
         application.add_handler(CommandHandler("help", self.help_command))
+        application.add_handler(CommandHandler("addclass", self.addclass_command))
+        application.add_handler(CommandHandler("deleteclass", self.deleteclass_command))
         application.add_handler(CommandHandler("logs", self.logs_command))
         application.add_handler(CommandHandler("quiz", self.quiz_command))
         application.add_handler(CommandHandler("summary", self.summary_command))
