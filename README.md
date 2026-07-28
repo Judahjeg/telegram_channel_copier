@@ -230,6 +230,24 @@ get a message when each session starts and finishes; nothing to trigger yourself
 
 ---
 
+## 🧠 Recovering Quiz Polls During Migration
+
+Telegram refuses to let this bot `copy_message` a quiz poll unless the bot itself created that
+quiz — it's how Telegram protects a quiz's correct answer from being read by anyone else, and no
+code change gets around it. If your old channel's quizzes were posted by a different bot/account
+(almost certainly true), every migration path (`/backfill`, `/autodeliver`, `/timedbackfill`)
+would otherwise just skip them silently.
+
+If you've connected your account with `/userbotlogin` (see below), the bot automatically
+recovers them instead: it reads the quiz's real question, options, and correct answer directly
+from the channel via your account (closed quizzes already reveal this; open ones get a single
+throwaway vote cast to force Telegram to reveal it), then recreates it as a fresh quiz poll on
+the destination with the same content. Without a connected account, quiz polls are skipped and
+reported clearly in the completion message, with a suggestion to use `/quiz ClassName` to
+generate a new AI practice quiz instead (not the original, but a working substitute).
+
+---
+
 ## 🕰️ Migrating Old Channels With Their Real Class Timing
 
 The bot itself (via the Telegram **Bot API**) can only react to messages posted while it's

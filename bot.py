@@ -492,6 +492,7 @@ class TelegramCopierBot:
         delivered = 0
 
         skipped_polls = 0
+        recreated_quizzes = 0
         skip_samples: List[str] = []
 
         try:
@@ -509,15 +510,12 @@ class TelegramCopierBot:
                     break
 
                 try:
-                    result = await self._call_with_retry(
-                        application.bot.copy_message,
-                        chat_id=dest_id,
-                        from_chat_id=source_id,
-                        message_id=cursor_id,
-                    )
+                    result, recreated = await self._copy_or_recover_quiz(application, source_id, dest_id, cursor_id)
                     if result:
                         db.save_message_mapping(pair_name, cursor_id, result.message_id)
                         delivered += 1
+                        if recreated:
+                            recreated_quizzes += 1
                 except BadRequest as e:
                     if self._is_poll_copy_restriction(e):
                         skipped_polls += 1
@@ -545,10 +543,12 @@ class TelegramCopierBot:
             pool_exhausted = cursor_id > end_id
             done_note = " The full backlog is now fully delivered! 🎉" if pool_exhausted else " More continues next scheduled session."
             poll_note = ""
+            if recreated_quizzes:
+                poll_note += f" 🧠 {recreated_quizzes} quiz poll(s) recreated with their real answer."
             if skipped_polls:
-                poll_note = (
+                poll_note += (
                     f" ({skipped_polls} quiz poll(s) skipped — Telegram only lets the bot that "
-                    f"created a quiz copy it, so those can't be brought over as-is; use /quiz to "
+                    f"created a quiz copy it, and the answer couldn't be recovered; use /quiz to "
                     f"generate fresh ones.)"
                 )
             samples_note = f"\n\n<code>{chr(10).join(skip_samples)}</code>" if skip_samples else ""
@@ -570,6 +570,41 @@ class TelegramCopierBot:
         no matter what. Detecting that here turns a silent skip into an explained one."""
         text = str(exc).lower()
         return "poll" in text or "quiz" in text
+
+    async def _copy_or_recover_quiz(self, application, source_id: int, dest_id: int, msg_id: int):
+        """Copies a message; if it's a quiz poll Telegram refuses to copy (the original-creator
+        restriction), tries to recover the real question/options/correct-answer via the connected
+        userbot account and recreate it as a fresh quiz instead of losing it outright. Returns
+        (result, recreated) - recreated=True means the quiz-recovery path was used. Re-raises the
+        original error if recovery isn't possible (not logged in, or the answer can't be read)."""
+        try:
+            result = await self._call_with_retry(
+                application.bot.copy_message,
+                chat_id=dest_id,
+                from_chat_id=source_id,
+                message_id=msg_id,
+            )
+            return result, False
+        except BadRequest as e:
+            if not self._is_poll_copy_restriction(e) or not await ub.is_logged_in():
+                raise
+
+            quiz_data = await ub.get_quiz_poll_data(source_id, msg_id)
+            if not quiz_data or quiz_data.correct_option_id is None or not quiz_data.options:
+                raise
+
+            options = [o[:95] for o in quiz_data.options][:10]
+            result = await self._call_with_retry(
+                application.bot.send_poll,
+                chat_id=dest_id,
+                question=(quiz_data.question or "Quiz Question")[:290],
+                options=options,
+                type="quiz",
+                correct_option_id=min(quiz_data.correct_option_id, len(options) - 1),
+                explanation=(quiz_data.explanation[:195] if quiz_data.explanation else None),
+                is_anonymous=False,
+            )
+            return result, True
 
     async def _call_with_retry(self, coro_func, max_attempts: int = 4, **kwargs):
         """Call a Telegram Bot API method, transparently retrying on flood-control (RetryAfter)
@@ -982,6 +1017,7 @@ class TelegramCopierBot:
         skipped = 0
         failed = 0
         skipped_polls = 0
+        recreated_quizzes = 0
         skip_samples: List[str] = []
         total = end_id - start_id + 1
 
@@ -989,18 +1025,16 @@ class TelegramCopierBot:
 
         for msg_id in range(start_id, end_id + 1):
             try:
-                result = await self._call_with_retry(
-                    application.bot.copy_message,
-                    chat_id=dest_id,
-                    from_chat_id=source_id,
-                    message_id=msg_id,
-                )
+                result, recreated = await self._copy_or_recover_quiz(application, source_id, dest_id, msg_id)
                 if result:
                     db.save_message_mapping(pair_name, msg_id, result.message_id)
                     copied += 1
+                    if recreated:
+                        recreated_quizzes += 1
             except BadRequest as e:
                 # Expected for gaps: deleted messages, service messages, or IDs that never existed -
-                # plus quiz polls, which Telegram will never let this bot copy (see below).
+                # plus quiz polls that couldn't be recovered (no userbot connected, or Telegram
+                # still won't reveal the answer even after voting).
                 skipped += 1
                 if self._is_poll_copy_restriction(e):
                     skipped_polls += 1
@@ -1030,13 +1064,15 @@ class TelegramCopierBot:
         logger.info(f"[Backfill:{pair_name}] Finished. Copied={copied} Skipped={skipped} Failed={failed}")
 
         poll_note = ""
+        if recreated_quizzes:
+            poll_note += f"\n\n🧠 <b>{recreated_quizzes} quiz poll(s) recreated</b> with their real question, options, and correct answer (recovered via your connected account)."
         if skipped_polls:
-            poll_note = (
-                f"\n\n📊 <b>{skipped_polls} of those were quiz polls</b> Telegram won't let this bot "
-                f"copy — only the bot that originally created a quiz can see its correct answer, so "
-                f"this is a Telegram platform rule, not something fixable here. If this channel is "
-                f"registered as a class, use <code>/quiz ClassName</code> to generate a fresh AI "
-                f"practice quiz instead."
+            poll_note += (
+                f"\n\n📊 <b>{skipped_polls} quiz poll(s) skipped</b> — Telegram won't let this bot "
+                f"copy them, and the correct answer couldn't be recovered "
+                f"{'(connect your account with /userbotlogin to enable recovery)' if not await ub.is_logged_in() else '(Telegram still would not reveal the answer)'}. "
+                f"If this channel is registered as a class, use <code>/quiz ClassName</code> to "
+                f"generate a fresh AI practice quiz instead."
             )
         samples_note = f"\n\n<code>{chr(10).join(skip_samples)}</code>" if skip_samples else ""
 
@@ -1498,6 +1534,7 @@ class TelegramCopierBot:
         copied = 0
         skipped = 0
         skipped_polls = 0
+        recreated_quizzes = 0
         skip_samples: List[str] = []
         total = len(session.messages)
 
@@ -1514,15 +1551,12 @@ class TelegramCopierBot:
                 continue
 
             try:
-                result = await self._call_with_retry(
-                    application.bot.copy_message,
-                    chat_id=dest_id,
-                    from_chat_id=source_id,
-                    message_id=msg.id,
-                )
+                result, recreated = await self._copy_or_recover_quiz(application, source_id, dest_id, msg.id)
                 if result:
                     db.save_message_mapping(pair_name, msg.id, result.message_id)
                     copied += 1
+                    if recreated:
+                        recreated_quizzes += 1
             except BadRequest as e:
                 skipped += 1
                 if self._is_poll_copy_restriction(e):
@@ -1547,10 +1581,12 @@ class TelegramCopierBot:
 
         logger.info(f"[TimedBackfill:{pair_name}] Finished. Copied={copied} Skipped={skipped}")
         poll_note = ""
+        if recreated_quizzes:
+            poll_note += f"\n\n🧠 <b>{recreated_quizzes} quiz poll(s) recreated</b> with their real question, options, and correct answer."
         if skipped_polls:
-            poll_note = (
-                f"\n\n📊 <b>{skipped_polls} of those were quiz polls</b> Telegram won't let this bot "
-                f"copy — only the bot that originally created a quiz can see its correct answer. "
+            poll_note += (
+                f"\n\n📊 <b>{skipped_polls} quiz poll(s) skipped</b> — Telegram won't let this bot "
+                f"copy them and the answer couldn't be recovered. "
                 f"Use <code>/quiz ClassName</code> to generate fresh AI practice quizzes instead."
             )
         samples_note = f"\n\n<code>{chr(10).join(skip_samples)}</code>" if skip_samples else ""

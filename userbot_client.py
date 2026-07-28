@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import datetime
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 
 from telethon import TelegramClient
-from telethon.tl.types import Channel, Chat, User
+from telethon.tl.types import Channel, Chat, User, MessageMediaPoll, UpdateMessagePoll
+from telethon.tl.functions.messages import SendVoteRequest
 
 SESSION_NAME = os.getenv("USERBOT_SESSION_NAME", "migration_userbot")
 
@@ -200,3 +202,73 @@ def analyze_channel(messages: List[MessageMeta], gap_minutes: float = 90.0) -> D
         "session_count": len(sessions),
         "sessions": session_summaries,
     }
+
+
+@dataclass
+class QuizData:
+    question: str
+    options: List[str]
+    correct_option_id: Optional[int]
+    explanation: str
+
+
+def _extract_correct_option(poll, results) -> Optional[int]:
+    """Match each answer's opaque `option` byte-id against the results' per-option `correct`
+    flag. Telegram only populates `correct` once the quiz's answer has been revealed to this
+    account - either because the poll is closed, or because this account has voted on it."""
+    if not results or not results.results:
+        return None
+    for i, answer in enumerate(poll.answers):
+        for voter in results.results:
+            if voter.option == answer.option and voter.correct:
+                return i
+    return None
+
+
+def _text_of(field) -> str:
+    return field.text if hasattr(field, "text") else str(field or "")
+
+
+async def get_quiz_poll_data(chat_id: int, msg_id: int) -> Optional[QuizData]:
+    """Reads a quiz poll's real question/options/correct-answer straight from the channel via
+    the userbot account - something the Bot API can never see for a quiz it didn't create itself.
+    If the correct answer isn't visible yet (poll still open, this account hasn't voted), casts
+    one vote to force Telegram to reveal it - quiz results become visible to an account the
+    moment it votes, whether or not the poll has been closed by its creator."""
+    client = get_client()
+    await client.start()
+    try:
+        msg = await client.get_messages(chat_id, ids=msg_id)
+        if isinstance(msg, list):
+            msg = msg[0] if msg else None
+        if not msg or not isinstance(msg.media, MessageMediaPoll):
+            return None
+
+        poll = msg.media.poll
+        results = msg.media.results
+        if not poll.quiz:
+            return None
+
+        options = [_text_of(a.text) for a in poll.answers]
+        correct_idx = _extract_correct_option(poll, results)
+
+        if correct_idx is None and not poll.closed and poll.answers:
+            try:
+                input_peer = await client.get_input_entity(chat_id)
+                update = await client(SendVoteRequest(peer=input_peer, msg_id=msg_id, options=[poll.answers[0].option]))
+                for u in getattr(update, "updates", []) or []:
+                    if isinstance(u, UpdateMessagePoll) and u.poll_id == poll.id:
+                        correct_idx = _extract_correct_option(poll, u.results)
+                        if correct_idx is not None:
+                            break
+            except Exception as e:
+                logging.getLogger("ChannelCopier").debug(f"[QuizRecovery] Vote-to-reveal failed for msg {msg_id}: {e}")
+
+        return QuizData(
+            question=_text_of(poll.question),
+            options=options,
+            correct_option_id=correct_idx,
+            explanation=(results.solution if results and results.solution else ""),
+        )
+    finally:
+        await client.disconnect()
