@@ -1211,6 +1211,42 @@ class TelegramCopierBot:
                     await self.logs_command(update, context)
                     return
 
+                elif act_type == "listchannels":
+                    context.args = []
+                    await self.mychannels_command(update, context)
+                    return
+
+                elif act_type == "analyzechannel" and act_data.get("channel_id"):
+                    args = [str(act_data["channel_id"])]
+                    if act_data.get("gap_minutes"):
+                        args.append(str(act_data["gap_minutes"]))
+                    context.args = args
+                    await self.analyzechannel_command(update, context)
+                    return
+
+                elif act_type == "previewtiming" and act_data.get("channel_id"):
+                    args = [str(act_data["channel_id"]), str(act_data.get("session_index", 0))]
+                    if act_data.get("gap_minutes"):
+                        args.append(str(act_data["gap_minutes"]))
+                    context.args = args
+                    await self.previewtiming_command(update, context)
+                    return
+
+                elif act_type == "backfill" and target_name:
+                    context.args = target_name.split() + [str(act_data["start_id"]), str(act_data["end_id"])]
+                    await self.backfill_command(update, context)
+                    return
+
+                elif act_type == "timedbackfill" and act_data.get("source_id") and act_data.get("dest_id") is not None:
+                    args = [str(act_data["source_id"]), str(act_data["dest_id"]), str(act_data.get("session_index", 0))]
+                    if act_data.get("gap_minutes"):
+                        args.append(str(act_data["gap_minutes"]))
+                        if act_data.get("max_gap_seconds"):
+                            args.append(str(act_data["max_gap_seconds"]))
+                    context.args = args
+                    await self.timedbackfill_command(update, context)
+                    return
+
             except Exception as e:
                 logger.error(f"Error parsing conversational AI action payload: {e}")
 
