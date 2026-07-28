@@ -208,6 +208,28 @@ The bot uses an SQLite database `copier.db` stored in the working directory. It 
 
 ---
 
+## 🗓️ Weekly Auto-Delivery (No Manual Triggering)
+
+For a range of old messages that should show up automatically every week during your actual
+class time slot, instead of running `/backfill` yourself each session:
+
+```
+/autodeliver source_id dest_id start_id end_id days start_time duration_minutes [Name]
+/autodeliver -1001111111111 -1002222222222 1 850 Mon,Wed,Fri 15:00 120 Physics
+```
+
+This delivers messages #1–850 automatically every Mon/Wed/Fri, starting at 15:00 **UTC**, spread
+naturally 2–5 minutes apart across a 120-minute window — picking up exactly where it left off
+each session until the whole range has been delivered over however many weeks that takes. You
+get a message when each session starts and finishes; nothing to trigger yourself. Use
+`/stopautodeliver` to see active schedules and remaining message counts, or
+`/stopautodeliver Name` to cancel one.
+
+**Times are UTC.** If you're in Nigeria (WAT, UTC+1), subtract 1 hour from your local class time
+— a 4pm WAT class is `15:00` here.
+
+---
+
 ## 🕰️ Migrating Old Channels With Their Real Class Timing
 
 The bot itself (via the Telegram **Bot API**) can only react to messages posted while it's

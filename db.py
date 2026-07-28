@@ -79,7 +79,119 @@ def init_db(db_path: str = DB_FILE) -> None:
             )
             """
         )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS content_pools (
+                pair_name TEXT PRIMARY KEY,
+                source_chat_id INTEGER NOT NULL,
+                dest_chat_id INTEGER NOT NULL,
+                cursor_id INTEGER NOT NULL,
+                end_id INTEGER NOT NULL,
+                session_days TEXT NOT NULL,
+                session_start TEXT NOT NULL,
+                session_duration_minutes INTEGER NOT NULL,
+                notify_chat_id INTEGER NOT NULL,
+                last_session_date TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
         conn.commit()
+
+
+def save_content_pool(
+    pair_name: str,
+    source_chat_id: int,
+    dest_chat_id: int,
+    start_id: int,
+    end_id: int,
+    session_days: str,
+    session_start: str,
+    session_duration_minutes: int,
+    notify_chat_id: int,
+    db_path: str = DB_FILE,
+) -> None:
+    """Create or replace a weekly auto-delivery pool: a range of old messages that gets drip-fed
+    into the destination during a recurring weekly time window, a bit at a time, until exhausted."""
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO content_pools
+                (pair_name, source_chat_id, dest_chat_id, cursor_id, end_id, session_days,
+                 session_start, session_duration_minutes, notify_chat_id, last_session_date, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+            ON CONFLICT(pair_name) DO UPDATE SET
+                source_chat_id = excluded.source_chat_id,
+                dest_chat_id = excluded.dest_chat_id,
+                cursor_id = excluded.cursor_id,
+                end_id = excluded.end_id,
+                session_days = excluded.session_days,
+                session_start = excluded.session_start,
+                session_duration_minutes = excluded.session_duration_minutes,
+                notify_chat_id = excluded.notify_chat_id,
+                last_session_date = NULL,
+                created_at = excluded.created_at
+            """,
+            (pair_name, source_chat_id, dest_chat_id, start_id, end_id, session_days,
+             session_start, session_duration_minutes, notify_chat_id, now_iso),
+        )
+        conn.commit()
+
+
+def get_all_content_pools(db_path: str = DB_FILE) -> List[Dict[str, Any]]:
+    """Retrieve all configured weekly auto-delivery pools."""
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT pair_name, source_chat_id, dest_chat_id, cursor_id, end_id, session_days,
+                   session_start, session_duration_minutes, notify_chat_id, last_session_date
+            FROM content_pools
+            """
+        )
+        rows = cursor.fetchall()
+        return [
+            {
+                "pair_name": r[0], "source_chat_id": r[1], "dest_chat_id": r[2],
+                "cursor_id": r[3], "end_id": r[4], "session_days": r[5],
+                "session_start": r[6], "session_duration_minutes": r[7],
+                "notify_chat_id": r[8], "last_session_date": r[9],
+            }
+            for r in rows
+        ]
+
+
+def get_content_pool(pair_name: str, db_path: str = DB_FILE) -> Optional[Dict[str, Any]]:
+    """Retrieve one pool's config/progress by pair name."""
+    for pool in get_all_content_pools(db_path=db_path):
+        if pool["pair_name"] == pair_name:
+            return pool
+    return None
+
+
+def update_pool_cursor(pair_name: str, cursor_id: int, db_path: str = DB_FILE) -> None:
+    """Advance a pool's delivery cursor after successfully copying a message."""
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE content_pools SET cursor_id = ? WHERE pair_name = ?", (cursor_id, pair_name))
+        conn.commit()
+
+
+def mark_pool_session_started(pair_name: str, date_str: str, db_path: str = DB_FILE) -> None:
+    """Record that today's scheduled session has already started, so it isn't re-triggered."""
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE content_pools SET last_session_date = ? WHERE pair_name = ?", (date_str, pair_name))
+        conn.commit()
+
+
+def delete_content_pool(pair_name: str, db_path: str = DB_FILE) -> bool:
+    """Remove a weekly auto-delivery pool."""
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM content_pools WHERE pair_name = ?", (pair_name,))
+        conn.commit()
+        return cursor.rowcount > 0
 
 
 def save_dynamic_class(

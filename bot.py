@@ -44,6 +44,17 @@ logger = logging.getLogger("ChannelCopier")
 START_TIME = time.time()
 USERBOT_LOGIN_STATE_FILE = ".login_state"
 
+WEEKDAY_MAP = {
+    "mon": 0, "monday": 0,
+    "tue": 1, "tues": 1, "tuesday": 1,
+    "wed": 2, "weds": 2, "wednesday": 2,
+    "thu": 3, "thurs": 3, "thursday": 3,
+    "fri": 4, "friday": 4,
+    "sat": 5, "saturday": 5,
+    "sun": 6, "sunday": 6,
+}
+WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
 
 VERIFY_FORM_HTML = """<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Connect Account</title></head><body style="font-family:sans-serif;max-width:420px;margin:40px auto;padding:0 16px;">
@@ -279,6 +290,9 @@ class TelegramCopierBot:
         # Per-admin in-progress migration built from forwarded messages instead of
         # manually-typed chat IDs/message IDs - see handle_forwarded_reference.
         self.pending_migration_refs: Dict[int, Dict[str, Any]] = {}
+        # pair_names with a scheduled weekly session currently delivering, so the
+        # scheduler loop doesn't start a second overlapping run for the same pool.
+        self._running_pool_sessions: Set[str] = set()
 
     async def update_pair_titles(self, pair: ChannelPair) -> None:
         """Fetch official chat titles from Telegram API so pairs display exact channel names."""
@@ -424,6 +438,115 @@ class TelegramCopierBot:
                     state_str = "🟢 ACTIVE" if curr_active else "⏳ DORMANT"
                     logger.info(f"[Pair: {pair.name}] State changed to {state_str}")
                 last_states[pair.name] = curr_active
+
+    async def content_pool_scheduler_loop(self, application) -> None:
+        """Checks every minute for weekly auto-delivery pools whose scheduled session window has
+        begun today, and kicks off that day's paced chunk automatically - the whole point being
+        the admin never has to manually trigger a session when class time comes around."""
+        while True:
+            await asyncio.sleep(60)
+            try:
+                now = datetime.datetime.now(datetime.timezone.utc)
+                today_str = now.strftime("%Y-%m-%d")
+                weekday = now.weekday()
+
+                for pool in db.get_all_content_pools():
+                    pair_name = pool["pair_name"]
+                    if pool["cursor_id"] > pool["end_id"]:
+                        continue
+                    if pair_name in self._running_pool_sessions:
+                        continue
+                    if pool["last_session_date"] == today_str:
+                        continue
+
+                    try:
+                        days = json.loads(pool["session_days"])
+                    except Exception:
+                        continue
+                    if weekday not in days:
+                        continue
+
+                    start_t = datetime.time.fromisoformat(pool["session_start"])
+                    start_dt = now.replace(hour=start_t.hour, minute=start_t.minute, second=0, microsecond=0)
+                    end_dt = start_dt + datetime.timedelta(minutes=pool["session_duration_minutes"])
+                    if not (start_dt <= now <= end_dt):
+                        continue
+
+                    self._running_pool_sessions.add(pair_name)
+                    db.mark_pool_session_started(pair_name, today_str)
+                    asyncio.create_task(self._run_scheduled_session(pool, end_dt, application))
+            except Exception as e:
+                logger.error(f"[ContentPoolScheduler] Error in scheduler tick: {e}", exc_info=True)
+
+    async def _run_scheduled_session(
+        self, pool: Dict[str, Any], end_dt: datetime.datetime, application
+    ) -> None:
+        """Delivers one day's chunk of a content pool, shuffled 2-5 min apart, stopping
+        automatically at the window's end time or when the pool runs dry - whichever first."""
+        pair_name = pool["pair_name"]
+        source_id = pool["source_chat_id"]
+        dest_id = pool["dest_chat_id"]
+        notify_chat_id = pool["notify_chat_id"]
+        cursor_id = pool["cursor_id"]
+        end_id = pool["end_id"]
+        delivered = 0
+
+        try:
+            try:
+                await application.bot.send_message(
+                    notify_chat_id,
+                    f"🔔 <b>{pair_name}:</b> today's scheduled session is starting - delivering content now.",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+
+            while cursor_id <= end_id:
+                if datetime.datetime.now(datetime.timezone.utc) >= end_dt:
+                    break
+
+                try:
+                    result = await self._call_with_retry(
+                        application.bot.copy_message,
+                        chat_id=dest_id,
+                        from_chat_id=source_id,
+                        message_id=cursor_id,
+                    )
+                    if result:
+                        db.save_message_mapping(pair_name, cursor_id, result.message_id)
+                        delivered += 1
+                except BadRequest as e:
+                    logger.debug(f"[ScheduledSession:{pair_name}] Skipped ID {cursor_id}: {e}")
+                except Exception as e:
+                    logger.warning(f"[ScheduledSession:{pair_name}] Failed ID {cursor_id}: {e}")
+
+                cursor_id += 1
+                db.update_pool_cursor(pair_name, cursor_id)
+
+                if cursor_id > end_id:
+                    break
+
+                remaining_window = (end_dt - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+                if remaining_window <= 60:
+                    # Not enough runway left for another natural gap - stop cleanly here rather
+                    # than squeezing the next message in with a near-zero delay (which would look
+                    # like an obvious burst). The rest continues at the next scheduled session.
+                    break
+
+                await asyncio.sleep(random.uniform(120, 300))
+
+            pool_exhausted = cursor_id > end_id
+            done_note = " The full backlog is now fully delivered! 🎉" if pool_exhausted else " More continues next scheduled session."
+            try:
+                await application.bot.send_message(
+                    notify_chat_id,
+                    f"✅ <b>{pair_name}:</b> today's session delivered {delivered} message(s).{done_note}",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+        finally:
+            self._running_pool_sessions.discard(pair_name)
 
     async def _call_with_retry(self, coro_func, max_attempts: int = 4, **kwargs):
         """Call a Telegram Bot API method, transparently retrying on flood-control (RetryAfter)
@@ -759,6 +882,10 @@ class TelegramCopierBot:
             "Example: <code>/backfill -1001111111111 -1002222222222 545 590</code>\n\n"
             "<i>Tip: Open the OLD channel, right-click the first and last message you want to migrate, "
             "and choose 'Copy Message Link'. The number at the end of each link is the message ID.</i>\n\n"
+            "⏱️ <b>Pacing:</b> messages post 2-5 minutes apart (shuffled), so migrated content lands with "
+            "a natural rhythm instead of an obvious rapid-fire dump - which means a few hundred messages "
+            "takes several hours, not minutes. If interrupted (e.g. a redeploy), just re-run the same "
+            "command - anything already copied is skipped automatically.\n\n"
             "⚠️ <b>Note:</b> Telegram's Bot API cannot read the *content* of old messages, only copy them "
             "as-is. So AI cleanup/anonymization only runs on messages received live going forward — "
             "backfilled posts keep their original captions untouched."
@@ -855,7 +982,7 @@ class TelegramCopierBot:
                 logger.warning(f"[Backfill:{pair_name}] Failed ID {msg_id}: {e}")
 
             done = copied + skipped + failed
-            if done % 25 == 0 or done == total:
+            if done % 10 == 0 or done == total:
                 try:
                     await application.bot.send_message(
                         notify_chat_id,
@@ -866,7 +993,9 @@ class TelegramCopierBot:
                 except Exception:
                     pass
 
-            await asyncio.sleep(random.uniform(2.5, 4.5))
+            # 2-5 minute shuffled spacing so migrated posts land with a natural rhythm
+            # instead of an obvious rapid-fire bulk dump.
+            await asyncio.sleep(random.uniform(120, 300))
 
         logger.info(f"[Backfill:{pair_name}] Finished. Copied={copied} Skipped={skipped} Failed={failed}")
         try:
@@ -878,6 +1007,120 @@ class TelegramCopierBot:
             )
         except Exception:
             pass
+
+    async def autodeliver_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Set up a weekly recurring auto-delivery pool: old channel materials drip out
+        automatically during a scheduled day/time window every week, no manual trigger needed."""
+        user = update.effective_user
+        if user:
+            self.is_user_admin(user.id)
+
+        args = context.args
+        usage = (
+            "🗓️ <b>Schedule automatic weekly content delivery:</b>\n\n"
+            "Syntax: <code>/autodeliver source_id dest_id start_id end_id days start_time duration_minutes [Name]</code>\n\n"
+            "<b>Example:</b>\n"
+            "<code>/autodeliver -1001111111111 -1002222222222 1 850 Mon,Wed,Fri 15:00 120 Physics</code>\n\n"
+            "This delivers messages #1-850 automatically every Mon/Wed/Fri, starting at 15:00 "
+            "<b>UTC</b>, spread naturally (2-5 min apart) across a 120-minute window — picking up "
+            "where it left off each session until the whole range has been delivered.\n\n"
+            "⚠️ <b>Times are in UTC.</b> Nigeria (WAT) is UTC+1, so a 4pm local class is "
+            "<code>15:00</code> here.\n\n"
+            "Use <code>/stopautodeliver</code> to see active schedules, or "
+            "<code>/stopautodeliver Name</code> to cancel one."
+        )
+
+        if not args or len(args) < 7:
+            await update.message.reply_text(usage, parse_mode="HTML")
+            return
+
+        try:
+            source_id = int(args[0])
+            dest_id = int(args[1])
+            start_id = int(args[2])
+            end_id = int(args[3])
+        except ValueError:
+            await update.message.reply_text("❌ source_id, dest_id, start_id, and end_id must all be numeric.", parse_mode="HTML")
+            return
+
+        day_tokens = [d.strip().lower() for d in args[4].split(",") if d.strip()]
+        days = sorted({WEEKDAY_MAP[d] for d in day_tokens if d in WEEKDAY_MAP})
+        if not days:
+            await update.message.reply_text("❌ Couldn't understand the days. Use e.g. <code>Mon,Wed,Fri</code>.", parse_mode="HTML")
+            return
+
+        try:
+            datetime.time.fromisoformat(args[5])
+        except ValueError:
+            await update.message.reply_text("❌ start_time must be HH:MM in 24-hour UTC, e.g. <code>15:00</code>.", parse_mode="HTML")
+            return
+        session_start = args[5]
+
+        try:
+            duration_minutes = int(args[6])
+        except ValueError:
+            await update.message.reply_text("❌ duration_minutes must be a number.", parse_mode="HTML")
+            return
+
+        if start_id > end_id:
+            start_id, end_id = end_id, start_id
+
+        display_name = " ".join(args[7:]).strip() or f"autodeliver_{source_id}_{dest_id}"
+
+        db.save_content_pool(
+            pair_name=display_name,
+            source_chat_id=source_id,
+            dest_chat_id=dest_id,
+            start_id=start_id,
+            end_id=end_id,
+            session_days=json.dumps(days),
+            session_start=session_start,
+            session_duration_minutes=duration_minutes,
+            notify_chat_id=update.effective_chat.id,
+        )
+
+        days_str = ", ".join(WEEKDAY_NAMES[d] for d in days)
+        await update.message.reply_text(
+            f"✅ <b>Scheduled!</b>\n\n"
+            f"📚 <b>{display_name}</b>\n"
+            f"📤 FROM: <code>{source_id}</code> (messages #{start_id}–{end_id})\n"
+            f"📥 TO: <code>{dest_id}</code>\n"
+            f"🗓️ Every <b>{days_str}</b>, starting <b>{session_start} UTC</b>, for <b>{duration_minutes} min</b>\n\n"
+            f"It starts automatically at the next scheduled time — no need to trigger it yourself. "
+            f"You'll get a message here when each session starts and finishes.",
+            parse_mode="HTML",
+        )
+
+    async def stopautodeliver_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """View active weekly auto-delivery schedules, or cancel one by name."""
+        user = update.effective_user
+        if user:
+            self.is_user_admin(user.id)
+
+        args = context.args
+        if not args:
+            pools = db.get_all_content_pools()
+            if not pools:
+                await update.message.reply_text("No auto-delivery schedules configured. Use /autodeliver to set one up.")
+                return
+            lines = ["🗓️ <b>Active Auto-Delivery Schedules:</b>\n"]
+            for p in pools:
+                remaining = max(p["end_id"] - p["cursor_id"] + 1, 0)
+                status = "✅ Complete" if remaining == 0 else f"{remaining} messages remaining"
+                lines.append(f"• <b>{p['pair_name']}</b>: {status}")
+            lines.append("\nUse <code>/stopautodeliver Name</code> to cancel one.")
+            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+            return
+
+        name = " ".join(args).strip()
+        if db.delete_content_pool(name):
+            await update.message.reply_text(f"🗑️ Stopped auto-delivery for <b>{name}</b>.", parse_mode="HTML")
+        else:
+            await update.message.reply_text(f"❌ No auto-delivery schedule named '<b>{name}</b>' found.", parse_mode="HTML")
 
     # ------------------------------------------------------------------
     # Userbot-powered commands: reading old channels' real history/timing
@@ -1375,6 +1618,23 @@ class TelegramCopierBot:
                     await self.timedbackfill_command(update, context)
                     return
 
+                elif act_type == "autodeliver" and act_data.get("source_id") and act_data.get("dest_id") is not None:
+                    args = [
+                        str(act_data["source_id"]), str(act_data["dest_id"]),
+                        str(act_data["start_id"]), str(act_data["end_id"]),
+                        str(act_data["days"]), str(act_data["start_time"]), str(act_data["duration_minutes"]),
+                    ]
+                    if act_data.get("name"):
+                        args.append(str(act_data["name"]))
+                    context.args = args
+                    await self.autodeliver_command(update, context)
+                    return
+
+                elif act_type == "stopautodeliver":
+                    context.args = [act_data["name"]] if act_data.get("name") else []
+                    await self.stopautodeliver_command(update, context)
+                    return
+
             except Exception as e:
                 logger.error(f"Error parsing conversational AI action payload: {e}")
 
@@ -1829,7 +2089,14 @@ class TelegramCopierBot:
             "to type, no /addclass needed.\n\n"
             "<i>(Prefer typing exact numbers? <code>/backfill source_id dest_id start_id end_id</code> "
             "works too, or <code>/backfill ClassName start_id end_id</code> for an already-registered class.)</i>\n\n"
-            "<b>2c. Replay Old Classes With Their Real Timing (advanced):</b>\n"
+            "<b>2c. Auto-Deliver On a Weekly Schedule (no manual triggering):</b>\n"
+            "<code>/autodeliver source_id dest_id start_id end_id days start_time duration_minutes [Name]</code>\n"
+            "Example: <code>/autodeliver -100111 -100222 1 850 Mon,Wed,Fri 15:00 120 Physics</code>\n"
+            "Delivers that message range automatically every Mon/Wed/Fri, starting 15:00 UTC, spread "
+            "2-5 min apart across a 120-minute window - picking up where it left off each session "
+            "until fully delivered. No need to run anything yourself when class time comes around. "
+            "Use <code>/stopautodeliver</code> to view or cancel schedules.\n\n"
+            "<b>2d. Replay Old Classes With Their Real Timing (advanced):</b>\n"
             "1. <code>/userbotlogin +yourphone</code> then open the web link it gives you to enter the "
             "code (never type the code into Telegram itself - it gets auto-blocked). One-time, needs "
             "TELEGRAM_API_ID/TELEGRAM_API_HASH set on the server.\n"
@@ -2126,6 +2393,8 @@ class TelegramCopierBot:
             BotCommand("start", "Explicit pair location overview"),
             BotCommand("addclass", "Add explicit FROM ➔ TO channel pair"),
             BotCommand("backfill", "Migrate old/existing messages into new channel"),
+            BotCommand("autodeliver", "Schedule weekly auto-delivery of old content"),
+            BotCommand("stopautodeliver", "View or cancel weekly auto-delivery schedules"),
             BotCommand("userbotlogin", "Connect account to read old channel history"),
             BotCommand("userbotverify", "Get the web link to finish connecting"),
             BotCommand("mychannels", "List your channels with chat IDs"),
@@ -2155,6 +2424,7 @@ class TelegramCopierBot:
             asyncio.create_task(self.update_pair_titles(pair))
 
         asyncio.create_task(self.activation_checker_loop())
+        asyncio.create_task(self.content_pool_scheduler_loop(application))
 
     def run(self) -> None:
         """Initialize PTB Application and start polling."""
@@ -2175,6 +2445,8 @@ class TelegramCopierBot:
         application.add_handler(CommandHandler("help", self.help_command))
         application.add_handler(CommandHandler("addclass", self.addclass_command))
         application.add_handler(CommandHandler("backfill", self.backfill_command))
+        application.add_handler(CommandHandler("autodeliver", self.autodeliver_command))
+        application.add_handler(CommandHandler("stopautodeliver", self.stopautodeliver_command))
         application.add_handler(CommandHandler("userbotlogin", self.userbotlogin_command))
         application.add_handler(CommandHandler("userbotverify", self.userbotverify_command))
         application.add_handler(CommandHandler("mychannels", self.mychannels_command))
