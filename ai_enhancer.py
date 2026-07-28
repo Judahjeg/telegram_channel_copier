@@ -11,6 +11,7 @@ from typing import List, Optional, Dict, Any
 logger = logging.getLogger("ChannelCopier")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 
 
 def clean_subject_name(raw_name: str) -> str:
@@ -22,8 +23,53 @@ def clean_subject_name(raw_name: str) -> str:
     return name
 
 
-def call_gemini_api(prompt_text: str, timeout_sec: int = 15) -> Optional[str]:
-    """Helper to call Gemini API with automatic model fallback and rate-limit retry."""
+def call_deepseek_api(prompt_text: str, timeout_sec: int = 15) -> Optional[str]:
+    """Call DeepSeek API (deepseek-chat) if DEEPSEEK_API_KEY is configured."""
+    if not DEEPSEEK_API_KEY:
+        return None
+
+    url = "https://api.deepseek.com/chat/completions"
+    payload = {
+        "model": "deepseek-chat",
+        "messages": [
+            {"role": "user", "content": prompt_text}
+        ],
+        "stream": False
+    }
+
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {DEEPSEEK_API_KEY}"
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            choices = data.get("choices", [])
+            if choices:
+                content = choices[0].get("message", {}).get("content", "").strip()
+                if content:
+                    logger.info("[DeepSeek AI] Response generated successfully.")
+                    return content
+    except Exception as e:
+        logger.debug(f"[DeepSeek AI] Request exception: {e}")
+
+    return None
+
+
+def call_ai_api(prompt_text: str, timeout_sec: int = 15) -> Optional[str]:
+    """Call AI provider (DeepSeek API if configured, or Google Gemini API with fallbacks)."""
+    # 1. Try DeepSeek if key is set
+    if DEEPSEEK_API_KEY:
+        ds_res = call_deepseek_api(prompt_text, timeout_sec=timeout_sec)
+        if ds_res:
+            return ds_res
+
+    # 2. Try Gemini API
     if not GEMINI_API_KEY:
         return None
 
@@ -36,7 +82,6 @@ def call_gemini_api(prompt_text: str, timeout_sec: int = 15) -> Optional[str]:
         ]
     }
 
-    # Retry up to 2 passes with a short pause if rate limited (429)
     for attempt in range(2):
         if attempt > 0:
             time.sleep(2)
@@ -73,7 +118,7 @@ def call_gemini_api(prompt_text: str, timeout_sec: int = 15) -> Optional[str]:
 def enhance_text_with_gemini(
     text: str, subject_name: str, mode: str = "flow", custom_instruction: Optional[str] = None
 ) -> str:
-    """Enhance educational post text using Google Gemini API."""
+    """Enhance educational post text using AI."""
     if not text or not text.strip() or mode == "off":
         return text
 
@@ -122,7 +167,7 @@ def enhance_text_with_gemini(
 
         prompt_text = prompts.get(mode, prompts["flow"])
 
-    result = call_gemini_api(prompt_text)
+    result = call_ai_api(prompt_text)
     if result:
         logger.info(f"[AI Enhancer] Enhanced post for {clean_name}.")
         return result
@@ -153,7 +198,7 @@ def answer_student_question(
         "TUTOR ANSWER:"
     )
 
-    answer = call_gemini_api(prompt_text, timeout_sec=15)
+    answer = call_ai_api(prompt_text, timeout_sec=15)
     if answer:
         logger.info(f"[AI Q&A] Answered student question for {clean_name}.")
         return f"🎓 <b>{clean_name} Tutor</b>:\n\n{answer}"
@@ -183,7 +228,7 @@ def process_admin_conversational_assistant(
         "RESPONSE:"
     )
 
-    result = call_gemini_api(prompt_text, timeout_sec=12)
+    result = call_ai_api(prompt_text, timeout_sec=12)
     if result:
         return result
 
