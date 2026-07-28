@@ -188,43 +188,54 @@ The bot uses an SQLite database `copier.db` stored in the working directory. It 
 
 ---
 
-## 🕰️ Migrating Old Channels With Their Real Class Timing (`migrate_cli.py`)
+## 🕰️ Migrating Old Channels With Their Real Class Timing
 
 The bot itself (via the Telegram **Bot API**) can only react to messages posted while it's
 running — it cannot read the *content* or *original timestamps* of messages already sitting in
-an old channel from a previous year. `migrate_cli.py` fills that gap using your own Telegram
-account (via [Telethon](https://docs.telethon.dev/)), which *can* read full channel history.
+an old channel from a previous year. Reading that requires a real Telegram user account (via
+[Telethon](https://docs.telethon.dev/)), which *can* read full channel history — something
+Bot API bots fundamentally cannot do. Two ways to use this:
 
-It lets you replay an old class's real message-by-message rhythm (the natural bursts and pauses
-from when the tutor actually taught it) into this year's channel, instead of dumping everything
-at once or on a fake uniform delay — while the actual posting still goes through your bot's
-`copy_message` call, so media is copied cleanly with no re-upload and no "Forwarded from" tag.
+### One-time setup (needed either way)
 
-### One-time setup
-
-1. Get a free `api_id` / `api_hash` from <https://my.telegram.org> → **API Development Tools**.
-2. Set them as environment variables alongside your existing `BOT_TOKEN`:
+1. Get a free `api_id` / `api_hash` from <https://my.telegram.org> → **API Development Tools**
+   (if the form errors on submit, make sure the "Short name" field has no symbols/spaces and the
+   URL field isn't empty — filling it with `https://example.com` is enough).
+2. Set them as environment variables on your server, alongside your existing `BOT_TOKEN`:
    ```bash
    export TELEGRAM_API_ID="12345678"
    export TELEGRAM_API_HASH="your_api_hash_here"
    ```
-3. Log in once (two steps, since it needs your live Telegram code):
-   ```bash
-   python migrate_cli.py login-request +2348012345678
-   # check Telegram/SMS for the code, then:
-   python migrate_cli.py login-verify 12345
-   ```
-   This creates a local `migration_userbot.session` file that persists the login — **treat it
-   like a password**, it grants full access to your Telegram account. Don't commit it or share it.
+   This must run somewhere with normal internet access (your VPS/Render host, or your own
+   machine) — Telegram's user-account protocol (MTProto) needs raw connectivity that sandboxed
+   CI-style environments often block, even when regular HTTPS works fine there.
 
-### Using it
+### Option A: From your phone, via the bot itself (recommended)
 
-Run `python migrate_cli.py` with no arguments for an interactive menu (list channels, analyze a
-channel's message/media volume and detected class sessions, preview the real timing of a
-session, dry-run a migration, or run it for real). Every action is also available as a direct
-subcommand (`python migrate_cli.py --help`) for scripting, e.g.:
+Once `TELEGRAM_API_ID`/`TELEGRAM_API_HASH` are set on the server running `bot.py`, just chat with
+your own bot:
+
+1. `/userbotlogin +2348012345678` → Telegram sends you a real login code.
+2. `/userbotverify 12345` (add your 2FA password as a second word if you have one).
+3. `/mychannels` — lists every channel/group you're in with its exact chat ID.
+4. `/analyzechannel <chat_id>` — message/media volume and how many class "sessions" (contiguous
+   bursts separated by big gaps, like overnight) got detected.
+5. `/previewtiming <chat_id> <session_index>` — preview the real message-by-message rhythm of one
+   session before committing to it.
+6. `/timedbackfill <source_id> <dest_id> <session_index>` — replays that session into the new
+   channel using its *real* original pacing (bursts and pauses, not a uniform fake delay), capped
+   so no single real-life pause stalls the whole replay. Posting still goes through the bot's own
+   `copy_message`, so media stays intact with no re-upload. Interrupted runs are resume-safe.
+
+This creates a `migration_userbot.session` file on the server the first time you log in — **treat
+it like a password**, it grants full access to your Telegram account. Never commit it.
+
+### Option B: `migrate_cli.py` from a terminal
+
+Same capabilities, scriptable from a terminal instead of Telegram:
 
 ```bash
+python migrate_cli.py login-request +2348012345678   # then login-verify <code>
 python migrate_cli.py list-channels
 python migrate_cli.py analyze -1001234567890
 python migrate_cli.py preview-timing -1001234567890 --session-index 0
@@ -232,7 +243,4 @@ python migrate_cli.py dry-run -1001234567890 -1009876543210 --session-index 0
 python migrate_cli.py run-backfill -1001234567890 -1009876543210 --session-index 0
 ```
 
-Real gaps between messages are replayed as-is (capped at `--max-gap-seconds`, default 20
-minutes, so one long real-life pause doesn't stall the whole replay). Runs are resume-safe: if
-interrupted, re-running the same `run-backfill` command skips messages already migrated for
-that pair name.
+Run `python migrate_cli.py` with no arguments for an interactive menu version of the same thing.

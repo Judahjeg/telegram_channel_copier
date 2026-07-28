@@ -29,6 +29,7 @@ from telegram.ext import (
 
 import db
 import ai_enhancer
+import userbot_client as ub
 
 # Setup console logging
 logging.basicConfig(
@@ -39,6 +40,7 @@ logging.basicConfig(
 logger = logging.getLogger("ChannelCopier")
 
 START_TIME = time.time()
+USERBOT_LOGIN_STATE_FILE = ".login_state"
 
 
 def start_dummy_web_server():
@@ -780,6 +782,364 @@ class TelegramCopierBot:
         except Exception:
             pass
 
+    # ------------------------------------------------------------------
+    # Userbot-powered commands: reading old channels' real history/timing
+    # (something the Bot API fundamentally cannot do) and replaying it with
+    # authentic pacing, all controllable from Telegram itself - no separate
+    # CLI/terminal needed since you're already chatting with the bot on your phone.
+    # ------------------------------------------------------------------
+
+    async def userbotlogin_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Step 1: request a Telegram login code for the userbot account that can read old channel history."""
+        user = update.effective_user
+        if user:
+            self.is_user_admin(user.id)
+
+        args = context.args
+        if not args:
+            await update.message.reply_text(
+                "🔐 <b>Connect your account to read old channel history:</b>\n\n"
+                "Syntax: <code>/userbotlogin +2348012345678</code>\n\n"
+                "<i>Requires TELEGRAM_API_ID and TELEGRAM_API_HASH to be set on the server "
+                "(free from my.telegram.org). This is separate from your bot token - it lets "
+                "the bot read the real content/timestamps of messages already sitting in an "
+                "old channel, which the Bot API alone cannot do.</i>",
+                parse_mode="HTML",
+            )
+            return
+
+        phone = args[0]
+        try:
+            phone_code_hash = await ub.request_login_code(phone)
+            with open(USERBOT_LOGIN_STATE_FILE, "w") as f:
+                f.write(f"{phone}\n{phone_code_hash}\n")
+            await update.message.reply_text(
+                f"📲 Login code sent to <b>{phone}</b>! Check Telegram/SMS, then reply with:\n"
+                f"<code>/userbotverify 12345</code>\n\n"
+                f"<i>(Add your 2FA password as a second word if you have one enabled.)</i>",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            await update.message.reply_text(f"❌ Could not send login code: {e}")
+
+    async def userbotverify_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Step 2: complete the userbot login with the code Telegram just sent."""
+        user = update.effective_user
+        if user:
+            self.is_user_admin(user.id)
+
+        args = context.args
+        if not args:
+            await update.message.reply_text("ℹ️ Usage: <code>/userbotverify 12345 [2fa_password]</code>", parse_mode="HTML")
+            return
+
+        if not os.path.exists(USERBOT_LOGIN_STATE_FILE):
+            await update.message.reply_text("❌ No pending login request. Start with <code>/userbotlogin +yourphone</code> first.", parse_mode="HTML")
+            return
+
+        code = args[0]
+        password = args[1] if len(args) > 1 else None
+
+        with open(USERBOT_LOGIN_STATE_FILE) as f:
+            phone, phone_code_hash = f.read().splitlines()
+
+        try:
+            result = await ub.complete_login(phone, code, phone_code_hash, password=password)
+            os.remove(USERBOT_LOGIN_STATE_FILE)
+            await update.message.reply_text(
+                f"✅ <b>{result}</b>\n\nYou can now use /mychannels, /analyzechannel, /previewtiming, and /timedbackfill.",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            await update.message.reply_text(f"❌ Login failed: {e}")
+
+    async def mychannels_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """List every channel/group the logged-in userbot account can see, with exact chat IDs."""
+        user = update.effective_user
+        if user:
+            self.is_user_admin(user.id)
+
+        if not await ub.is_logged_in():
+            await update.message.reply_text("❌ Not connected yet. Run <code>/userbotlogin +yourphone</code> first.", parse_mode="HTML")
+            return
+
+        await update.message.reply_text("🔍 Fetching your channels...")
+        try:
+            channels = await ub.list_channels()
+        except Exception as e:
+            await update.message.reply_text(f"❌ Could not list channels: {e}")
+            return
+
+        if not channels:
+            await update.message.reply_text("No channels/groups found.")
+            return
+
+        lines = ["📚 <b>Your Channels & Groups:</b>\n"]
+        for c in channels:
+            uname = f" (@{c.username})" if c.username else ""
+            lines.append(f"• <code>{c.id}</code> [{c.kind}] {c.title}{uname}")
+
+        # Telegram messages cap at ~4096 chars - send in chunks if needed
+        full_text = "\n".join(lines)
+        for i in range(0, len(full_text), 3500):
+            await update.message.reply_text(full_text[i:i + 3500], parse_mode="HTML")
+
+    async def analyzechannel_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Test/inspect a channel before migrating it: message count, media volume, detected class sessions."""
+        user = update.effective_user
+        if user:
+            self.is_user_admin(user.id)
+
+        args = context.args
+        if not args:
+            await update.message.reply_text(
+                "ℹ️ Usage: <code>/analyzechannel channel_id [gap_minutes]</code>\n"
+                "Example: <code>/analyzechannel -1001234567890 90</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        if not await ub.is_logged_in():
+            await update.message.reply_text("❌ Not connected yet. Run <code>/userbotlogin +yourphone</code> first.", parse_mode="HTML")
+            return
+
+        try:
+            channel_id = int(args[0])
+        except ValueError:
+            await update.message.reply_text("❌ channel_id must be a numeric chat ID.")
+            return
+        gap_minutes = float(args[1]) if len(args) > 1 else 90.0
+
+        await update.message.reply_text(f"🔍 Reading history for <code>{channel_id}</code>... this can take a while for large channels.", parse_mode="HTML")
+
+        try:
+            messages = await ub.fetch_channel_history(channel_id)
+            stats = ub.analyze_channel(messages, gap_minutes=gap_minutes)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Could not analyze channel: {e}")
+            return
+
+        if stats["message_count"] == 0:
+            await update.message.reply_text("No messages found (check the ID and that your account is a member).")
+            return
+
+        lines = [
+            f"📊 <b>Channel Analysis: {channel_id}</b>\n",
+            f"Messages: <b>{stats['message_count']}</b>",
+            f"Date range: {stats['date_range'][0]} → {stats['date_range'][1]}",
+            f"Media messages: {stats['media_count']}",
+            f"Approx text volume: ~{stats['estimated_tokens']} tokens",
+            f"Detected sessions (gap &gt; {gap_minutes:.0f}min): <b>{stats['session_count']}</b>\n",
+        ]
+        for i, s in enumerate(stats["sessions"][:20]):
+            lines.append(
+                f"  [{i}] {s['start']} → {s['end']} "
+                f"({s['message_count']} msgs, {s['media_count']} media, {s['duration_minutes']}min)"
+            )
+        if stats["session_count"] > 20:
+            lines.append(f"  ... and {stats['session_count'] - 20} more sessions")
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    async def previewtiming_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Preview the real message-by-message timing of one detected session before replaying it."""
+        user = update.effective_user
+        if user:
+            self.is_user_admin(user.id)
+
+        args = context.args
+        if not args:
+            await update.message.reply_text(
+                "ℹ️ Usage: <code>/previewtiming channel_id [session_index] [gap_minutes]</code>\n"
+                "Example: <code>/previewtiming -1001234567890 0 90</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        if not await ub.is_logged_in():
+            await update.message.reply_text("❌ Not connected yet. Run <code>/userbotlogin +yourphone</code> first.", parse_mode="HTML")
+            return
+
+        try:
+            channel_id = int(args[0])
+            session_index = int(args[1]) if len(args) > 1 else 0
+            gap_minutes = float(args[2]) if len(args) > 2 else 90.0
+        except ValueError:
+            await update.message.reply_text("❌ channel_id and session_index must be numbers.")
+            return
+
+        try:
+            messages = await ub.fetch_channel_history(channel_id)
+            sessions = ub.group_into_sessions(messages, gap_minutes=gap_minutes)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Could not read channel: {e}")
+            return
+
+        if not sessions:
+            await update.message.reply_text("No messages found in this channel.")
+            return
+        if session_index >= len(sessions):
+            await update.message.reply_text(f"❌ Only {len(sessions)} session(s) detected (valid index range: 0-{len(sessions) - 1}).")
+            return
+
+        session = sessions[session_index]
+        deltas = session.deltas_seconds
+        lines = [
+            f"⏱️ <b>Session [{session_index}] Timing:</b> {session.start_date.strftime('%Y-%m-%d %H:%M')} "
+            f"→ {session.end_date.strftime('%Y-%m-%d %H:%M')}\n"
+            f"{len(session.messages)} messages, {session.duration_seconds / 60:.1f} min total\n",
+        ]
+        preview = list(zip(session.messages, deltas))
+        head = preview[:15]
+        tail = preview[-5:] if len(preview) > 20 else []
+        for msg, delta in head:
+            kind = "🖼️" if msg.has_media else "📝"
+            lines.append(f"  +{delta:>6.0f}s {kind} msg #{msg.id}")
+        if tail:
+            lines.append(f"  ... {len(preview) - 20} more messages ...")
+            for msg, delta in tail:
+                kind = "🖼️" if msg.has_media else "📝"
+                lines.append(f"  +{delta:>6.0f}s {kind} msg #{msg.id}")
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    async def timedbackfill_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Replay a detected session's REAL original message timing into a destination channel,
+        so the delivery feels like the live class actually happening rather than a bulk dump."""
+        user = update.effective_user
+        if user:
+            self.is_user_admin(user.id)
+
+        args = context.args
+        if not args or len(args) < 3:
+            await update.message.reply_text(
+                "ℹ️ <b>Usage:</b>\n"
+                "<code>/timedbackfill source_id dest_id session_index [gap_minutes] [max_gap_seconds]</code>\n\n"
+                "<b>Example:</b>\n"
+                "<code>/timedbackfill -1001234567890 -1009876543210 0 90 1200</code>\n\n"
+                "<i>Use /analyzechannel first to see how many sessions are detected, and "
+                "/previewtiming to check a session's rhythm before running it for real.</i>",
+                parse_mode="HTML",
+            )
+            return
+
+        if not await ub.is_logged_in():
+            await update.message.reply_text("❌ Not connected yet. Run <code>/userbotlogin +yourphone</code> first.", parse_mode="HTML")
+            return
+
+        try:
+            source_id = int(args[0])
+            dest_id = int(args[1])
+            session_index = int(args[2])
+            gap_minutes = float(args[3]) if len(args) > 3 else 90.0
+            max_gap_seconds = float(args[4]) if len(args) > 4 else 1200.0
+        except ValueError:
+            await update.message.reply_text("❌ source_id, dest_id, and session_index must be numbers.")
+            return
+
+        try:
+            messages = await ub.fetch_channel_history(source_id)
+            sessions = ub.group_into_sessions(messages, gap_minutes=gap_minutes)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Could not read source channel: {e}")
+            return
+
+        if not sessions:
+            await update.message.reply_text("No messages found in this channel.")
+            return
+        if session_index >= len(sessions):
+            await update.message.reply_text(f"❌ Only {len(sessions)} session(s) detected (valid index range: 0-{len(sessions) - 1}).")
+            return
+
+        session = sessions[session_index]
+        await update.message.reply_text(
+            f"📦 <b>Timed replay started!</b>\n"
+            f"Session [{session_index}]: {len(session.messages)} messages from <code>{source_id}</code> "
+            f"→ <code>{dest_id}</code>, using the class's real original pacing (capped at {max_gap_seconds:.0f}s/gap).\n\n"
+            f"You'll get progress updates here.",
+            parse_mode="HTML",
+        )
+
+        asyncio.create_task(
+            self._run_timed_backfill_from_userbot(
+                session, source_id, dest_id, session_index, max_gap_seconds, update.effective_chat.id, context.application
+            )
+        )
+
+    async def _run_timed_backfill_from_userbot(
+        self, session: ub.Session, source_id: int, dest_id: int, session_index: int,
+        max_gap_seconds: float, notify_chat_id: int, application,
+    ) -> None:
+        """Worker that replays one userbot-derived session with its real timing, posting via the
+        bot's own copy_message so media stays intact - resume-safe against message_mappings."""
+        pair_name = f"userbot_{source_id}_{dest_id}_s{session_index}"
+        deltas = session.deltas_seconds
+        copied = 0
+        skipped = 0
+        total = len(session.messages)
+
+        logger.info(f"[TimedBackfill:{pair_name}] Starting replay of {total} messages.")
+
+        for (msg, delta) in zip(session.messages, deltas):
+            wait_s = min(delta, max_gap_seconds)
+            if wait_s > 0:
+                await asyncio.sleep(wait_s)
+
+            already = db.get_dest_msg_id(pair_name, msg.id)
+            if already:
+                skipped += 1
+                continue
+
+            try:
+                result = await self._call_with_retry(
+                    application.bot.copy_message,
+                    chat_id=dest_id,
+                    from_chat_id=source_id,
+                    message_id=msg.id,
+                )
+                if result:
+                    db.save_message_mapping(pair_name, msg.id, result.message_id)
+                    copied += 1
+            except BadRequest as e:
+                skipped += 1
+                logger.debug(f"[TimedBackfill:{pair_name}] Skipped ID {msg.id}: {e}")
+            except Exception as e:
+                skipped += 1
+                logger.warning(f"[TimedBackfill:{pair_name}] Failed ID {msg.id}: {e}")
+
+            done = copied + skipped
+            if done % 20 == 0 or done == total:
+                try:
+                    await application.bot.send_message(
+                        notify_chat_id,
+                        f"⏳ <b>Timed replay progress:</b> {done}/{total} (✅ {copied} copied, ⏭️ {skipped} skipped)",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+
+        logger.info(f"[TimedBackfill:{pair_name}] Finished. Copied={copied} Skipped={skipped}")
+        try:
+            await application.bot.send_message(
+                notify_chat_id,
+                f"🎉 <b>Timed replay complete!</b>\n\n✅ Copied: {copied}\n⏭️ Skipped: {skipped}",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
     async def handle_admin_conversational_chat(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -982,6 +1342,8 @@ class TelegramCopierBot:
             "👇 <b>Quick Commands Menu:</b>\n"
             "• /addclass - Add an explicit FROM ➔ TO channel pair\n"
             "• /backfill - Migrate previously posted materials from an old channel\n"
+            "• /userbotlogin - Connect your account to read old channels' real history & timing\n"
+            "• /mychannels, /analyzechannel, /previewtiming, /timedbackfill - Test & replay old classes with their real pacing\n"
             "• /pairs - View explicit FROM ➔ TO channel pair flows\n"
             "• /deleteclass - Delete a channel pair\n"
             "• /clearallclasses - Wipe all channel pairs\n"
@@ -1188,6 +1550,12 @@ class TelegramCopierBot:
             "<b>2b. Migrate Previously Posted Materials:</b>\n"
             "New pairs only copy messages posted while the bot is running. To bring over materials "
             "already sitting in an old channel, use <code>/backfill ClassName start_id end_id</code>.\n\n"
+            "<b>2c. Replay Old Classes With Their Real Timing:</b>\n"
+            "1. <code>/userbotlogin +yourphone</code> then <code>/userbotverify code</code> (one-time, needs "
+            "TELEGRAM_API_ID/TELEGRAM_API_HASH set on the server).\n"
+            "2. <code>/mychannels</code> to find chat IDs, <code>/analyzechannel id</code> to see detected class sessions.\n"
+            "3. <code>/previewtiming id session_index</code> to preview the real rhythm, then "
+            "<code>/timedbackfill source_id dest_id session_index</code> to replay it for real.\n\n"
             "<b>3. Delete Any Channel Pair:</b>\n"
             "Tell the AI in chat or use <code>/deleteclass ClassName</code>\n\n"
             "<b>4. Wipe All Classes to Start Fresh:</b>\n"
@@ -1478,6 +1846,12 @@ class TelegramCopierBot:
             BotCommand("start", "Explicit pair location overview"),
             BotCommand("addclass", "Add explicit FROM ➔ TO channel pair"),
             BotCommand("backfill", "Migrate old/existing messages into new channel"),
+            BotCommand("userbotlogin", "Connect account to read old channel history"),
+            BotCommand("userbotverify", "Finish connecting with the login code"),
+            BotCommand("mychannels", "List your channels with chat IDs"),
+            BotCommand("analyzechannel", "Test a channel: volume & detected sessions"),
+            BotCommand("previewtiming", "Preview a session's real message timing"),
+            BotCommand("timedbackfill", "Replay a session with its real original pacing"),
             BotCommand("pairs", "View explicit FROM ➔ TO channel pairs"),
             BotCommand("deleteclass", "Delete a channel pair"),
             BotCommand("clearallclasses", "Wipe all channel pairs"),
@@ -1521,6 +1895,12 @@ class TelegramCopierBot:
         application.add_handler(CommandHandler("help", self.help_command))
         application.add_handler(CommandHandler("addclass", self.addclass_command))
         application.add_handler(CommandHandler("backfill", self.backfill_command))
+        application.add_handler(CommandHandler("userbotlogin", self.userbotlogin_command))
+        application.add_handler(CommandHandler("userbotverify", self.userbotverify_command))
+        application.add_handler(CommandHandler("mychannels", self.mychannels_command))
+        application.add_handler(CommandHandler("analyzechannel", self.analyzechannel_command))
+        application.add_handler(CommandHandler("previewtiming", self.previewtiming_command))
+        application.add_handler(CommandHandler("timedbackfill", self.timedbackfill_command))
         application.add_handler(CommandHandler("deleteclass", self.deleteclass_command))
         application.add_handler(CommandHandler("clearallclasses", self.clearallclasses_command))
         application.add_handler(CommandHandler("logs", self.logs_command))
