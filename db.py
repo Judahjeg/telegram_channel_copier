@@ -149,6 +149,14 @@ def delete_dynamic_class(name: str, db_path: str = DB_FILE) -> bool:
         return cursor.rowcount > 0
 
 
+def clear_all_dynamic_classes(db_path: str = DB_FILE) -> None:
+    """Wipe all dynamic classes to allow setting up from scratch."""
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM dynamic_classes")
+        conn.commit()
+
+
 def get_last_processed_id(pair_name: str, db_path: str = DB_FILE) -> Optional[int]:
     """Retrieve the last processed message ID for a given channel pair."""
     with sqlite3.connect(db_path) as conn:

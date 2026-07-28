@@ -166,26 +166,6 @@ class TelegramCopierBot:
         """Load and synchronize dynamic class configurations from SQLite database into memory maps."""
         db_classes = db.get_all_dynamic_classes()
 
-        if not db_classes and os.path.exists(self.config_path):
-            try:
-                with open(self.config_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                pairs_config = data if isinstance(data, list) else data.get("pairs", [])
-                for p_cfg in pairs_config:
-                    db.save_dynamic_class(
-                        name=p_cfg["name"],
-                        source_chat_id=int(p_cfg["source_chat_id"]),
-                        destination_chat_id=int(p_cfg["destination_chat_id"]),
-                        discussion_chat_id=int(p_cfg["discussion_chat_id"]) if p_cfg.get("discussion_chat_id") else None,
-                        delay_min_seconds=float(p_cfg.get("delay_min_seconds", 120.0)),
-                        delay_max_seconds=float(p_cfg.get("delay_max_seconds", 240.0)),
-                        ai_mode=p_cfg.get("ai_mode", "flow"),
-                    )
-                db_classes = db.get_all_dynamic_classes()
-                logger.info(f"Seeded {len(db_classes)} initial classes from config.json into SQLite database.")
-            except Exception as e:
-                logger.error(f"Error seeding config.json to DB: {e}")
-
         # Re-build memory maps
         self.source_map.clear()
         self.discussion_map.clear()
@@ -238,8 +218,11 @@ class TelegramCopierBot:
                     raw_admins.append(int(aid))
 
         self.admin_user_ids = set(raw_admins)
+        
+        # Wipe all default classes as requested by user
+        db.clear_all_dynamic_classes()
         self.sync_classes_from_db()
-        logger.info(f"Loaded {len(self.pairs)} channel pairs and {len(self.admin_user_ids)} bot admins.")
+        logger.info(f"Clean slate active. Loaded {len(self.pairs)} channel pairs and {len(self.admin_user_ids)} bot admins.")
 
     def find_pair_by_name(self, search_term: str) -> Optional[ChannelPair]:
         """Flexible name lookup supporting exact match and partial fuzzy match."""
@@ -270,6 +253,8 @@ class TelegramCopierBot:
 
     def get_classes_summary(self) -> str:
         """Generate summary string of all classes for the AI assistant."""
+        if not self.pairs:
+            return "No active classes right now. The administrator has a clean slate."
         lines = []
         for p in self.pairs:
             cp = db.get_custom_prompt(p.name)
@@ -505,7 +490,7 @@ class TelegramCopierBot:
 
             disc_str = f" | Discussion: <code>{disc_id}</code>" if disc_id else ""
             await update.message.reply_text(
-                f"🎉 <b>Success!</b> Class channel <b>{c_name}</b> has been set up!\n\n"
+                f"🎉 <b>Success!</b> Custom Class <b>{c_name}</b> has been set up!\n\n"
                 f"• Source ID: <code>{source_id}</code>\n"
                 f"• Destination ID: <code>{dest_id}</code>{disc_str}\n"
                 f"• Status: 🟢 Active and listening now!",
@@ -535,6 +520,19 @@ class TelegramCopierBot:
             await update.message.reply_text(f"🗑️ <b>Deleted!</b> Class channel <b>{target_name}</b> was removed successfully.", parse_mode="HTML")
         else:
             await update.message.reply_text(f"❌ Class <b>{target_name}</b> not found.", parse_mode="HTML")
+
+    async def clearallclasses_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Wipe all existing class configurations to start completely from scratch."""
+        user = update.effective_user
+        if user and not self.is_user_admin(user.id):
+            await update.message.reply_text("⛔ <b>Access Denied:</b> Only authorized bot admins can clear all classes.", parse_mode="HTML")
+            return
+
+        db.clear_all_dynamic_classes()
+        self.sync_classes_from_db()
+        await update.message.reply_text("🧹 <b>Clean Slate Activated!</b> All default and custom classes have been deleted. You can now add your own classes from scratch using `/addclass`!", parse_mode="HTML")
 
     async def handle_admin_conversational_chat(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -712,12 +710,12 @@ class TelegramCopierBot:
                 f"• <b>{p.name}:</b> Source <code>{p.source_chat_id}</code> ➔ Destination <code>{p.destination_chat_id}</code>{disc_str}"
             )
 
-        locations_block = "\n".join(channel_locations) if channel_locations else "<i>No channels connected yet.</i>"
+        locations_block = "\n".join(channel_locations) if channel_locations else "<i>No classes connected yet. Use /addclass to add your first class!</i>"
 
         msg = (
             f"🧙‍♂️ <b>Welcome to Iconic Impact Tutor AI Co-Pilot, {user.first_name if user else 'User'}!</b>\n\n"
             f"Your Telegram User ID: <code>{user.id if user else 'Unknown'}</code>\n\n"
-            "I am your Conversational AI Manager Assistant! You have <b>100% full flexibility</b> to set up any class channels you want directly via chat or commands!\n\n"
+            "✨ <b>Clean Slate Active!</b> All default classes have been removed. You can now set up your own classes from scratch!\n\n"
             f"📍 <b>Where Bot is Currently Added & Active:</b>\n"
             f"{locations_block}\n\n"
             f"📊 <b>Bot Overview:</b>\n"
@@ -728,13 +726,14 @@ class TelegramCopierBot:
             f"• 📜 <b>Student Interaction Logs:</b> 🟢 Active (`/logs`)\n"
             f"• 🤖 <b>AI Engine:</b> {has_ai}\n\n"
             "💬 <b>Chat with me naturally or run commands:</b>\n"
+            "• <code>/addclass ClassName SourceChatID DestinationChatID</code>\n"
             "• <i>'Add a class called Further Maths with source -100123 and dest -100456'</i>\n"
-            "• <code>/addclass Maths 1 -100123456789 -100987654321</code>\n"
-            "• <code>/deleteclass Physics 1</code>\n"
-            "• <i>'Show student logs'</i>\n\n"
+            "• <code>/deleteclass ClassName</code>\n"
+            "• <code>/clearallclasses</code> (Wipe all classes)\n\n"
             "👇 <b>Quick Commands Menu:</b>\n"
             "• /addclass - Add/Set up a new custom class channel\n"
             "• /deleteclass - Delete a class channel\n"
+            "• /clearallclasses - Wipe all classes to start over\n"
             "• /logs - View recent student Q&A interaction logs\n"
             "• /schedule - View & manage weekly class timetables\n"
             "• /quiz - Generate interactive quiz for a class\n"
@@ -808,7 +807,7 @@ class TelegramCopierBot:
             await update.message.reply_text(
                 "ℹ️ <b>How to generate a Practice Quiz:</b>\n\n"
                 "<code>/quiz ClassName</code>\n"
-                "Example: <code>/quiz Chemistry 1</code>",
+                "Example: <code>/quiz Mathematics 1</code>",
                 parse_mode="HTML",
             )
             return
@@ -837,7 +836,7 @@ class TelegramCopierBot:
             await update.message.reply_text(
                 "ℹ️ <b>How to generate a Weekly Master Study Guide:</b>\n\n"
                 "<code>/summary ClassName</code>\n"
-                "Example: <code>/summary Chemistry 1</code>",
+                "Example: <code>/summary Mathematics 1</code>",
                 parse_mode="HTML",
             )
             return
@@ -868,19 +867,21 @@ class TelegramCopierBot:
         if not args:
             lines = [
                 "✏️ <b>Custom AI Prompt Instructions per Class Channel:</b>\n\n"
-                "You can specify instructions for exact class channels (e.g., Chemistry 1 or Chemistry 2)!\n\n"
+                "You can specify instructions for your class channels!\n\n"
                 "<b>How to set a custom prompt:</b>\n"
                 "<code>/prompt ClassName Your custom instructions here...</code>\n\n"
                 "<b>Examples:</b>\n"
-                "• <code>/prompt Chemistry 1 Focus on basic atomic structures</code>\n"
-                "• <code>/prompt Chemistry 2 Focus on reaction equations</code>\n"
-                "• <code>/prompt Chemistry 1 reset</code> <i>(Resets to default)</i>\n\n"
+                "• <code>/prompt Mathematics 1 Focus on basic formulas</code>\n"
+                "• <code>/prompt Mathematics 1 reset</code> <i>(Resets to default)</i>\n\n"
                 "<b>Current Custom Prompts:</b>"
             ]
             for p in self.pairs:
                 cp = db.get_custom_prompt(p.name)
                 cp_str = f"<code>{cp}</code>" if cp else "<i>Default flow polishing</i>"
                 lines.append(f"• <b>{p.name}:</b> {cp_str}")
+
+            if not self.pairs:
+                lines.append("<i>No active classes. Use /addclass to add your first class!</i>")
 
             await update.message.reply_text("\n".join(lines), parse_mode="HTML")
             return
@@ -937,9 +938,11 @@ class TelegramCopierBot:
             "Tell the AI in chat or use <code>/addclass ClassName source_id dest_id [discussion_id]</code>\n\n"
             "<b>2. Delete Any Class Channel:</b>\n"
             "Tell the AI in chat or use <code>/deleteclass ClassName</code>\n\n"
-            "<b>3. Priority Lesson Notes Search:</b>\n"
+            "<b>3. Wipe All Classes to Start Fresh:</b>\n"
+            "Use <code>/clearallclasses</code>\n\n"
+            "<b>4. Priority Lesson Notes Search:</b>\n"
             "AI tutor scans class channel notes first before external knowledge.\n\n"
-            "<b>4. Student Interaction Logs (`/logs`):</b>\n"
+            "<b>5. Student Interaction Logs (`/logs`):</b>\n"
             "View recent student questions and AI answers."
         )
         await update.message.reply_text(msg, parse_mode="HTML")
@@ -1013,6 +1016,10 @@ class TelegramCopierBot:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Display weekly class schedule timetable."""
+        if not self.pairs:
+            await update.message.reply_text("📅 <b>Weekly Class Schedule Timetable:</b>\n\nNo classes configured yet. Use `/addclass ClassName source_id dest_id` to add one!", parse_mode="HTML")
+            return
+
         lines = ["📅 <b>Weekly Class Schedule Timetable:</b>\n"]
         for p in self.pairs:
             lines.append(f"<b>Class: {p.name}</b>")
@@ -1046,11 +1053,11 @@ class TelegramCopierBot:
             await update.message.reply_text(
                 "ℹ️ <b>How to set Free AI Mode for a class:</b>\n\n"
                 "• <b>Flow / Polish</b> (Improves flow & readability):\n"
-                "  <code>/ai Chemistry 1 flow</code>\n\n"
+                "  <code>/ai Mathematics 1 flow</code>\n\n"
                 "• <b>Custom Instructions</b>:\n"
-                "  <code>/prompt Chemistry 2 Keep it concise with key points</code>\n\n"
+                "  <code>/prompt Mathematics 1 Keep it concise with key points</code>\n\n"
                 "• <b>Turn Off AI</b>:\n"
-                "  <code>/ai Chemistry 1 off</code>",
+                "  <code>/ai Mathematics 1 off</code>",
                 parse_mode="HTML",
             )
             return
@@ -1097,9 +1104,9 @@ class TelegramCopierBot:
             await update.message.reply_text(
                 "ℹ️ <b>How to dictate message spacing (delay):</b>\n\n"
                 "• Set fixed delay for exact class (e.g. 180 sec):\n"
-                "  <code>/setdelay Chemistry 1 180</code>\n\n"
+                "  <code>/setdelay Mathematics 1 180</code>\n\n"
                 "• Set random range delay:\n"
-                "  <code>/setdelay Chemistry 2 60 120</code>",
+                "  <code>/setdelay Mathematics 1 60 120</code>",
                 parse_mode="HTML",
             )
             return
@@ -1162,7 +1169,7 @@ class TelegramCopierBot:
         args = context.args
         if not args:
             await update.message.reply_text(
-                "ℹ️ <b>Usage:</b> <code>/activate ClassName</code>\nExample: <code>/activate Chemistry 1</code>",
+                "ℹ️ <b>Usage:</b> <code>/activate ClassName</code>\nExample: <code>/activate Mathematics 1</code>",
                 parse_mode="HTML",
             )
             return
@@ -1225,6 +1232,7 @@ class TelegramCopierBot:
             BotCommand("start", "Location overview & AI setup wizard"),
             BotCommand("addclass", "Add/set up a new custom class channel"),
             BotCommand("deleteclass", "Delete a class channel"),
+            BotCommand("clearallclasses", "Wipe all classes to start over"),
             BotCommand("logs", "View student Q&A interaction logs"),
             BotCommand("quiz", "Generate interactive practice quiz poll"),
             BotCommand("summary", "Generate weekly master study guide"),
@@ -1265,6 +1273,7 @@ class TelegramCopierBot:
         application.add_handler(CommandHandler("help", self.help_command))
         application.add_handler(CommandHandler("addclass", self.addclass_command))
         application.add_handler(CommandHandler("deleteclass", self.deleteclass_command))
+        application.add_handler(CommandHandler("clearallclasses", self.clearallclasses_command))
         application.add_handler(CommandHandler("logs", self.logs_command))
         application.add_handler(CommandHandler("quiz", self.quiz_command))
         application.add_handler(CommandHandler("summary", self.summary_command))
