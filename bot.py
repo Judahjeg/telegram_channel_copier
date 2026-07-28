@@ -49,7 +49,7 @@ def start_dummy_web_server():
             self.wfile.write(b"Iconic Impact Tutor Bot is running live!")
 
         def log_message(self, format, *args):
-            pass  # Suppress HTTP access logs
+            pass
 
     def run_server():
         try:
@@ -195,6 +195,30 @@ class TelegramCopierBot:
             self.discussion_map[pair.destination_chat_id] = pair
 
         logger.info(f"Loaded {len(self.pairs)} channel pairs and {len(self.admin_user_ids)} bot admins.")
+
+    def find_pair_by_name(self, search_term: str) -> Optional[ChannelPair]:
+        """Flexible name lookup supporting exact match and partial fuzzy match (e.g. 'chemistry 1' or 'chem 1')."""
+        term = search_term.strip().lower()
+        if not term:
+            return None
+
+        # 1. Exact match
+        for p in self.pairs:
+            if p.name.lower() == term:
+                return p
+
+        # 2. Substring match
+        for p in self.pairs:
+            if term in p.name.lower():
+                return p
+
+        # 3. Match normalized words (e.g., 'chem 1' -> 'chemistry 1')
+        normalized_term = term.replace("chem", "chemistry").replace("bio", "biology").replace("phys", "physics").replace("math", "mathematics")
+        for p in self.pairs:
+            if normalized_term in p.name.lower() or p.name.lower() in normalized_term:
+                return p
+
+        return None
 
     def is_user_admin(self, user_id: int) -> bool:
         """Check if a user is an authorized bot administrator."""
@@ -356,13 +380,13 @@ class TelegramCopierBot:
             return
 
         pair = self.discussion_map.get(chat.id)
-        subject_name = pair.name if pair else "Class"
+        exact_class_name = pair.name if pair else (chat.title or "Class")
 
         question = message.text
         if bot_user:
             question = question.replace(f"@{bot_user}", "").strip()
 
-        logger.info(f"Received Q&A question in {chat.title or chat.id} for {subject_name}: '{question}'")
+        logger.info(f"Received Q&A question in '{chat.title or chat.id}' for exact class '{exact_class_name}': '{question}'")
 
         context_notes = []
         if pair:
@@ -370,7 +394,7 @@ class TelegramCopierBot:
 
         ai_response = ai_enhancer.answer_student_question(
             question=question,
-            subject_name=subject_name,
+            subject_name=exact_class_name,
             class_context_texts=context_notes,
         )
 
@@ -453,20 +477,20 @@ class TelegramCopierBot:
         msg = (
             f"🤖 <b>Welcome, {user.first_name if user else 'User'}!</b>\n\n"
             f"Your Telegram User ID is: <code>{user.id if user else 'Unknown'}</code>\n\n"
-            "I manage message copying for your subjects with custom AI prompts, flow polishing, weekly schedules, and Discussion Group Q&A.\n\n"
+            "I manage message copying for your exact subject classes (e.g., Chemistry 1, Chemistry 2) with custom AI prompts, flow polishing, weekly schedules, and Discussion Group Q&A.\n\n"
             f"📊 <b>Overview:</b>\n"
-            f"• <b>Total Subjects:</b> {len(self.pairs)}\n"
-            f"• 🟢 <b>Active Subjects:</b> {active_count}\n"
-            f"• ⏳ <b>Dormant Subjects:</b> {dormant_count}\n"
+            f"• <b>Total Class Channels:</b> {len(self.pairs)}\n"
+            f"• 🟢 <b>Active Classes:</b> {active_count}\n"
+            f"• ⏳ <b>Dormant Classes:</b> {dormant_count}\n"
             f"• 🎓 <b>Discussion Q&A AI:</b> 🟢 Active\n"
             f"• 🤖 <b>AI Enhancer:</b> {has_ai}\n\n"
             "👇 <b>Easy Commands Menu:</b>\n"
-            "• /pairs - View all subjects & status\n"
-            "• /prompt - Set custom AI instructions per subject\n"
-            "• /ai - Configure AI mode (flow, paraphrase, off)\n"
-            "• /setdelay - Dictate message spacing\n"
+            "• /pairs - View all exact classes & status\n"
+            "• /prompt - Set custom AI instructions per class\n"
+            "• /ai - Configure AI mode per class\n"
+            "• /setdelay - Dictate message spacing per class\n"
             "• /schedule - View weekly class timetable\n"
-            "• /activate - Toggle subject active state\n"
+            "• /activate - Toggle class active state\n"
             "• /addadmin - Authorize another user as admin\n"
             "• /status - View system status\n"
             "• /help - Beginner guide & help tips\n"
@@ -476,7 +500,7 @@ class TelegramCopierBot:
     async def prompt_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Set or view custom AI prompt instructions per subject directly in Telegram."""
+        """Set or view custom AI prompt instructions per exact class channel."""
         user = update.effective_user
         if user and not self.is_user_admin(user.id):
             await update.message.reply_text("⛔ <b>Access Denied:</b> Only authorized bot admins can customize AI prompts.", parse_mode="HTML")
@@ -485,14 +509,14 @@ class TelegramCopierBot:
         args = context.args
         if not args:
             lines = [
-                "✏️ <b>Custom AI Prompt Instructions per Subject:</b>\n\n"
-                "You can give your own custom editing instructions to the AI without needing code changes!\n\n"
+                "✏️ <b>Custom AI Prompt Instructions per Class Channel:</b>\n\n"
+                "You can specify instructions for exact class channels (e.g., Chemistry 1 or Chemistry 2)!\n\n"
                 "<b>How to set a custom prompt:</b>\n"
-                "<code>/prompt SubjectName Your custom instructions here...</code>\n\n"
+                "<code>/prompt ClassName Your custom instructions here...</code>\n\n"
                 "<b>Examples:</b>\n"
-                "• <code>/prompt Biology Keep sentences short and add 2 study emojis</code>\n"
-                "• <code>/prompt Chemistry Focus on highlighting key formulas in bold</code>\n"
-                "• <code>/prompt Physics reset</code> <i>(Resets to default)</i>\n\n"
+                "• <code>/prompt Chemistry 1 Focus on basic atomic structures</code>\n"
+                "• <code>/prompt Chemistry 2 Focus on reaction equations</code>\n"
+                "• <code>/prompt Chemistry 1 reset</code> <i>(Resets to default)</i>\n\n"
                 "<b>Current Custom Prompts:</b>"
             ]
             for p in self.pairs:
@@ -503,18 +527,22 @@ class TelegramCopierBot:
             await update.message.reply_text("\n".join(lines), parse_mode="HTML")
             return
 
-        target_name = args[0].strip().lower()
-        found_pair = None
-        for p in self.pairs:
-            if p.name.lower() == target_name:
-                found_pair = p
-                break
+        # Use flexible matching to find exact class pair
+        search_query = args[0]
+        instruction_start_idx = 1
+
+        # Check if first two args make a class name like 'Chemistry 1'
+        if len(args) >= 2 and args[1].isdigit():
+            search_query = f"{args[0]} {args[1]}"
+            instruction_start_idx = 2
+
+        found_pair = self.find_pair_by_name(search_query)
 
         if not found_pair:
-            await update.message.reply_text(f"❌ Subject '<b>{args[0]}</b>' not found.", parse_mode="HTML")
+            await update.message.reply_text(f"❌ Class channel '<b>{search_query}</b>' not found in config.json.", parse_mode="HTML")
             return
 
-        instruction_text = " ".join(args[1:]).strip()
+        instruction_text = " ".join(args[instruction_start_idx:]).strip()
 
         if not instruction_text:
             cp = db.get_custom_prompt(found_pair.name)
@@ -538,7 +566,7 @@ class TelegramCopierBot:
         logger.info(f"Saved custom AI prompt for {found_pair.name}: '{instruction_text}'")
         await update.message.reply_text(
             f"✅ <b>Updated AI Prompt Instructions!</b>\n\n"
-            f"Subject: <b>{found_pair.name}</b>\n"
+            f"Class Channel: <b>{found_pair.name}</b>\n"
             f"New AI Instructions: <code>{instruction_text}</code>",
             parse_mode="HTML",
         )
@@ -548,11 +576,15 @@ class TelegramCopierBot:
     ) -> None:
         """Explanatory guide."""
         msg = (
-            "📖 <b>Custom AI Prompt Instructions Guide</b>\n\n"
-            "<b>Customize AI output anytime from Telegram:</b>\n"
-            "Send <code>/prompt Biology Make posts bulleted and simple</code> to instantly change how the AI polishes Biology posts!\n\n"
+            "📖 <b>Exact Class Channel Management Guide</b>\n\n"
+            "<b>Multi-Level Class Support:</b>\n"
+            "You can configure exact class channel names like <code>Chemistry 1</code> and <code>Chemistry 2</code> in <code>config.json</code>.\n\n"
+            "<b>Examples:</b>\n"
+            "• <code>/prompt Chemistry 1 Focus on basic concepts</code>\n"
+            "• <code>/prompt Chemistry 2 Focus on organic synthesis</code>\n"
+            "• <code>/setdelay Chemistry 1 180</code>\n\n"
             "<b>Discussion Group Q&A:</b>\n"
-            "When students tag <code>@Iconic_impact_tutor_bot</code> in discussion groups, it answers questions using class lesson notes."
+            "When students tag <code>@Iconic_impact_tutor_bot</code> in discussion groups, it identifies the exact class (e.g. Chemistry 1) and answers tailored to that class level!"
         )
         await update.message.reply_text(msg, parse_mode="HTML")
 
@@ -572,10 +604,10 @@ class TelegramCopierBot:
             "⚙️ <b>Bot System Dashboard</b>\n\n"
             f"• <b>Status:</b> 🟢 Running smoothly\n"
             f"• <b>Uptime:</b> {hours}h {minutes}m {seconds}s\n"
-            f"• <b>Total Subjects:</b> {len(self.pairs)}\n"
+            f"• <b>Total Class Channels:</b> {len(self.pairs)}\n"
             f"• 🟢 <b>Active Right Now:</b> {len(active_pairs)}\n"
             f"• 📬 <b>Messages Queued:</b> {total_queued}\n"
-            f"• ✏️ <b>Custom AI Prompts:</b> Active\n"
+            f"• ✏️ <b>Flexible Class Matching:</b> Active\n"
             f"• 🎓 <b>Discussion Q&A AI:</b> 🟢 Enabled\n"
             f"• 🤖 <b>AI Status:</b> {has_ai}\n"
         )
@@ -589,7 +621,7 @@ class TelegramCopierBot:
             await update.message.reply_text("No channel pairs configured.")
             return
 
-        lines = ["📚 <b>Subject Pairs, Spacing & AI Status:</b>\n"]
+        lines = ["📚 <b>Exact Class Channels, Spacing & AI Status:</b>\n"]
         for p in self.pairs:
             status_icon = "🟢 <b>ACTIVE</b>" if p.is_active else "⏳ <b>DORMANT</b>"
             q_size = p.queue.qsize()
@@ -602,7 +634,7 @@ class TelegramCopierBot:
                 spacing_str = f"{p.delay_min_seconds:.0f}–{p.delay_max_seconds:.0f} sec"
 
             lines.append(
-                f"<b>Subject: {p.name}</b>\n"
+                f"<b>Class: {p.name}</b>\n"
                 f"• Status: {status_icon}\n"
                 f"• Spacing: ⏱️ <b>{spacing_str}</b>\n"
                 f"• AI Settings: 🤖 {prompt_summary}\n"
@@ -620,7 +652,7 @@ class TelegramCopierBot:
         """Display weekly class schedule timetable."""
         lines = ["📅 <b>Weekly Class Schedule Timetable:</b>\n"]
         for p in self.pairs:
-            lines.append(f"<b>Subject: {p.name}</b>")
+            lines.append(f"<b>Class: {p.name}</b>")
             if p.schedule:
                 days = ", ".join(p.schedule.get("active_days", []))
                 st = p.schedule.get("start_time", "00:00")
@@ -649,40 +681,41 @@ class TelegramCopierBot:
         args = context.args
         if not args or len(args) < 2:
             await update.message.reply_text(
-                "ℹ️ <b>How to set Free AI Mode for a subject:</b>\n\n"
-                "• <b>Flow / Polish</b> (Improves flow & readability without changing content):\n"
-                "  <code>/ai Biology flow</code>\n\n"
-                "• <b>Custom Instructions</b> (Set custom prompt):\n"
-                "  <code>/prompt Biology Keep it concise with key points</code>\n\n"
-                "• <b>Turn Off AI</b> (Copy posts cleanly without AI):\n"
-                "  <code>/ai Mathematics off</code>",
+                "ℹ️ <b>How to set Free AI Mode for a class:</b>\n\n"
+                "• <b>Flow / Polish</b> (Improves flow & readability):\n"
+                "  <code>/ai Chemistry 1 flow</code>\n\n"
+                "• <b>Custom Instructions</b>:\n"
+                "  <code>/prompt Chemistry 2 Keep it concise with key points</code>\n\n"
+                "• <b>Turn Off AI</b>:\n"
+                "  <code>/ai Chemistry 1 off</code>",
                 parse_mode="HTML",
             )
             return
 
-        target_name = args[0].strip().lower()
-        mode_input = args[1].strip().lower()
+        search_query = args[0]
+        mode_idx = 1
+        if len(args) >= 3 and args[1].isdigit():
+            search_query = f"{args[0]} {args[1]}"
+            mode_idx = 2
+
+        mode_input = args[mode_idx].strip().lower()
 
         valid_modes = {"off", "flow", "polish", "paraphrase", "summarize", "hashtags"}
         if mode_input not in valid_modes:
             await update.message.reply_text(f"❌ Invalid AI mode. Choose from: <code>flow</code>, <code>off</code>, <code>paraphrase</code>, <code>summarize</code>, <code>hashtags</code>.", parse_mode="HTML")
             return
 
-        found_pair = None
-        for p in self.pairs:
-            if p.name.lower() == target_name:
-                found_pair = p
-                break
+        found_pair = self.find_pair_by_name(search_query)
 
         if not found_pair:
-            await update.message.reply_text(f"❌ Subject '<b>{args[0]}</b>' not found.", parse_mode="HTML")
+            await update.message.reply_text(f"❌ Class '<b>{search_query}</b>' not found.", parse_mode="HTML")
             return
 
         found_pair.ai_mode = mode_input
         logger.info(f"Updated AI mode for {found_pair.name}: {mode_input}")
         await update.message.reply_text(
             f"🤖 <b>AI Mode Updated!</b>\n\n"
-            f"Subject: <b>{found_pair.name}</b>\n"
+            f"Class: <b>{found_pair.name}</b>\n"
             f"New AI Mode: <code>{mode_input}</code>",
             parse_mode="HTML",
         )
@@ -700,18 +733,23 @@ class TelegramCopierBot:
         if not args or len(args) < 2:
             await update.message.reply_text(
                 "ℹ️ <b>How to dictate message spacing (delay):</b>\n\n"
-                "• Set fixed delay (e.g. 180 sec = 3 min):\n"
-                "  <code>/setdelay Biology 180</code>\n\n"
-                "• Set random range delay (e.g. 60 to 120 sec):\n"
-                "  <code>/setdelay Biology 60 120</code>",
+                "• Set fixed delay for exact class (e.g. 180 sec):\n"
+                "  <code>/setdelay Chemistry 1 180</code>\n\n"
+                "• Set random range delay:\n"
+                "  <code>/setdelay Chemistry 2 60 120</code>",
                 parse_mode="HTML",
             )
             return
 
-        subject_input = args[0].strip().lower()
+        search_query = args[0]
+        val_idx = 1
+        if len(args) >= 3 and args[1].isdigit():
+            search_query = f"{args[0]} {args[1]}"
+            val_idx = 2
+
         try:
-            val1 = float(args[1])
-            val2 = float(args[2]) if len(args) >= 3 else val1
+            val1 = float(args[val_idx])
+            val2 = float(args[val_idx + 1]) if len(args) > val_idx + 1 else val1
         except ValueError:
             await update.message.reply_text("❌ Delay values must be numbers (in seconds).")
             return
@@ -719,14 +757,10 @@ class TelegramCopierBot:
         min_sec = min(val1, val2)
         max_sec = max(val1, val2)
 
-        found_pair = None
-        for p in self.pairs:
-            if p.name.lower() == subject_input:
-                found_pair = p
-                break
+        found_pair = self.find_pair_by_name(search_query)
 
         if not found_pair:
-            await update.message.reply_text(f"❌ Subject '<b>{args[0]}</b>' not found.", parse_mode="HTML")
+            await update.message.reply_text(f"❌ Class '<b>{search_query}</b>' not found.", parse_mode="HTML")
             return
 
         found_pair.delay_min_seconds = min_sec
@@ -740,7 +774,7 @@ class TelegramCopierBot:
         logger.info(f"Updated spacing for {found_pair.name}: {min_sec}-{max_sec}s")
         await update.message.reply_text(
             f"✅ <b>Updated Message Spacing!</b>\n\n"
-            f"Subject: <b>{found_pair.name}</b>\n"
+            f"Class Channel: <b>{found_pair.name}</b>\n"
             f"New Spacing: {fmt_desc} between messages.",
             parse_mode="HTML",
         )
@@ -757,20 +791,16 @@ class TelegramCopierBot:
         args = context.args
         if not args:
             await update.message.reply_text(
-                "ℹ️ <b>Usage:</b> <code>/activate SubjectName</code>\nExample: <code>/activate Biology</code>",
+                "ℹ️ <b>Usage:</b> <code>/activate ClassName</code>\nExample: <code>/activate Chemistry 1</code>",
                 parse_mode="HTML",
             )
             return
 
-        target_name = " ".join(args).strip().lower()
-        found_pair = None
-        for p in self.pairs:
-            if p.name.lower() == target_name:
-                found_pair = p
-                break
+        search_query = " ".join(args).strip()
+        found_pair = self.find_pair_by_name(search_query)
 
         if not found_pair:
-            await update.message.reply_text(f"❌ Subject '<b>{target_name}</b>' not found.", parse_mode="HTML")
+            await update.message.reply_text(f"❌ Class '<b>{search_query}</b>' not found.", parse_mode="HTML")
             return
 
         new_state = not found_pair.is_active
@@ -779,7 +809,7 @@ class TelegramCopierBot:
 
         logger.info(f"User toggled pair {found_pair.name} to {state_word}")
         await update.message.reply_text(
-            f"🎉 Subject '<b>{found_pair.name}</b>' is now <b>{state_word}</b>!",
+            f"🎉 Class '<b>{found_pair.name}</b>' is now <b>{state_word}</b>!",
             parse_mode="HTML",
         )
 
@@ -822,12 +852,12 @@ class TelegramCopierBot:
 
         commands = [
             BotCommand("start", "Welcome message & quick menu"),
-            BotCommand("pairs", "View subjects, spacing & AI status"),
-            BotCommand("prompt", "Set custom AI instructions per subject"),
-            BotCommand("ai", "Configure AI mode (flow, paraphrase, off)"),
-            BotCommand("setdelay", "Dictate message spacing (Admin)"),
+            BotCommand("pairs", "View exact classes, spacing & AI status"),
+            BotCommand("prompt", "Set custom AI instructions per class"),
+            BotCommand("ai", "Configure AI mode per class (flow, off)"),
+            BotCommand("setdelay", "Dictate message spacing per class"),
             BotCommand("schedule", "View weekly class timetable"),
-            BotCommand("activate", "Toggle subject active state (Admin)"),
+            BotCommand("activate", "Toggle class active state (Admin)"),
             BotCommand("addadmin", "Authorize another bot admin (Admin)"),
             BotCommand("status", "System status & message queues"),
             BotCommand("help", "Beginner guide & help tips"),
