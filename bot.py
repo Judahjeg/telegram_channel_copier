@@ -18,7 +18,7 @@ import urllib.error
 import urllib.parse
 from typing import Dict, List, Any, Optional, Set
 
-from telegram import Update, BotCommand
+from telegram import Update, BotCommand, MessageOriginChannel
 from telegram.error import RetryAfter, BadRequest, TimedOut, NetworkError
 from telegram.request import HTTPXRequest
 from telegram.ext import (
@@ -276,6 +276,9 @@ class TelegramCopierBot:
         self.discussion_map: Dict[int, ChannelPair] = {}
         self.admin_user_ids: Set[int] = set()
         self.application = None
+        # Per-admin in-progress migration built from forwarded messages instead of
+        # manually-typed chat IDs/message IDs - see handle_forwarded_reference.
+        self.pending_migration_refs: Dict[int, Dict[str, Any]] = {}
 
     async def update_pair_titles(self, pair: ChannelPair) -> None:
         """Fetch official chat titles from Telegram API so pairs display exact channel names."""
@@ -1379,12 +1382,71 @@ class TelegramCopierBot:
         clean_text = re.sub(r'<ACTION>.*?</ACTION>', '', ai_reply, flags=re.DOTALL).strip()
         await message.reply_text(clean_text, parse_mode="HTML")
 
+    async def handle_forwarded_reference(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """No IDs to hunt for, no login needed: forward a message from the old channel (twice, to
+        mark the start and end of the range), then one from the new channel, and this builds the
+        exact backfill for you - reusing the plain Bot API /backfill under the hood."""
+        message = update.effective_message
+        user = update.effective_user
+        origin = message.forward_origin
+
+        if not isinstance(origin, MessageOriginChannel):
+            await message.reply_text(
+                "🤔 I can read forwards from channels, but couldn't find the original channel/message "
+                "on this one (maybe it's not from a channel, or the channel hides forward info). "
+                "Try forwarding an actual post from the channel, or just tell me the channel's ID directly."
+            )
+            return
+
+        fchat = origin.chat
+        fmsg_id = origin.message_id
+        refs = self.pending_migration_refs.setdefault(user.id, {})
+
+        if "source" not in refs:
+            refs["source"] = {"chat_id": fchat.id, "title": fchat.title}
+            refs["start_id"] = fmsg_id
+            await message.reply_text(
+                f"📌 Got it — <b>{fchat.title}</b> (<code>{fchat.id}</code>), starting from message #{fmsg_id}.\n\n"
+                f"Now forward me the LAST message you want migrated from this same old channel.",
+                parse_mode="HTML",
+            )
+        elif fchat.id == refs["source"]["chat_id"] and "end_id" not in refs:
+            refs["end_id"] = fmsg_id
+            await message.reply_text(
+                f"📌 Got the end point — message #{fmsg_id}.\n\n"
+                f"Now forward me any message from the NEW channel you want this copied into.",
+                parse_mode="HTML",
+            )
+        elif "dest" not in refs:
+            refs["dest"] = {"chat_id": fchat.id, "title": fchat.title}
+            refs["ready"] = True
+            start = refs["start_id"]
+            end = refs.get("end_id", start)
+            await message.reply_text(
+                f"✅ <b>Got everything I need!</b>\n\n"
+                f"📤 FROM: <b>{refs['source']['title']}</b> (<code>{refs['source']['chat_id']}</code>)\n"
+                f"📥 TO: <b>{fchat.title}</b> (<code>{fchat.id}</code>)\n"
+                f"Range: messages #{start}–{end}\n\n"
+                f"Reply <b>yes</b> to start migrating, or forward a different message to start over.",
+                parse_mode="HTML",
+            )
+        else:
+            self.pending_migration_refs[user.id] = {"source": {"chat_id": fchat.id, "title": fchat.title}, "start_id": fmsg_id}
+            await message.reply_text(
+                f"🔄 Starting a fresh migration reference: <b>{fchat.title}</b>, message #{fmsg_id}. "
+                f"Forward the LAST message from this channel next.",
+                parse_mode="HTML",
+            )
+
     async def handle_incoming_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Handle incoming channel posts and messages."""
         message = update.effective_message
         chat = update.effective_chat
+        user = update.effective_user
 
         if not message or not chat:
             return
@@ -1393,7 +1455,22 @@ class TelegramCopierBot:
             await self.handle_discussion_qa(update, context)
             return
 
+        if chat.type == "private" and message.forward_origin:
+            await self.handle_forwarded_reference(update, context)
+            return
+
         if chat.type == "private" and message.text and not message.text.startswith("/"):
+            user_id = user.id if user else 0
+            refs = self.pending_migration_refs.get(user_id)
+            if refs and refs.get("ready") and message.text.strip().lower() in ("yes", "y", "confirm", "go", "start", "yes please"):
+                context.args = [
+                    str(refs["source"]["chat_id"]), str(refs["dest"]["chat_id"]),
+                    str(refs["start_id"]), str(refs.get("end_id", refs["start_id"])),
+                ]
+                self.pending_migration_refs.pop(user_id, None)
+                await self.backfill_command(update, context)
+                return
+
             await self.handle_admin_conversational_chat(update, context)
             return
 
