@@ -17,6 +17,7 @@ import urllib.error
 from typing import Dict, List, Any, Optional, Set
 
 from telegram import Update, BotCommand
+from telegram.error import RetryAfter, BadRequest, TimedOut, NetworkError
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     ApplicationBuilder,
@@ -352,6 +353,23 @@ class TelegramCopierBot:
                     logger.info(f"[Pair: {pair.name}] State changed to {state_str}")
                 last_states[pair.name] = curr_active
 
+    async def _call_with_retry(self, coro_func, max_attempts: int = 4, **kwargs):
+        """Call a Telegram Bot API method, transparently retrying on flood-control (RetryAfter)
+        and transient network errors instead of silently dropping the message."""
+        for attempt in range(max_attempts):
+            try:
+                return await coro_func(**kwargs)
+            except RetryAfter as e:
+                wait_s = float(e.retry_after) + 1.0
+                logger.warning(f"⏱️ Flood control hit. Waiting {wait_s:.0f}s before retrying...")
+                await asyncio.sleep(wait_s)
+            except (TimedOut, NetworkError) as e:
+                if attempt == max_attempts - 1:
+                    raise
+                logger.debug(f"Transient network error ({e}), retrying (attempt {attempt + 1})...")
+                await asyncio.sleep(3 * (attempt + 1))
+        return None
+
     async def pair_worker_loop(self, pair: ChannelPair, application) -> None:
         """Dedicated worker loop per subject pair applying custom AI prompt instructions, spacing, sanitization, and reply linking."""
         logger.info(f"[Pair: {pair.name}] Worker task started.")
@@ -396,11 +414,64 @@ class TelegramCopierBot:
 
                 custom_instruction = db.get_custom_prompt(pair.name)
 
+                # A message carries media (photo/video/document/etc.) if it arrived as an
+                # album, or was flagged as such when queued. Media must ALWAYS go through
+                # copy_message/copy_messages so the attachment itself is never dropped -
+                # send_message only transmits text and would silently discard the file.
+                has_media = item["type"] == "album" or item.get("has_media", False)
+
+                enhanced_text: Optional[str] = None
                 if pair.ai_mode != "off" and sanitized_text:
                     enhanced_text = ai_enhancer.enhance_text_with_gemini(
                         sanitized_text, pair.name, pair.ai_mode, custom_instruction=custom_instruction
                     )
-                    sent_msg = await application.bot.send_message(
+
+                if has_media:
+                    if item["type"] == "single":
+                        copied_msg_id_obj = await self._call_with_retry(
+                            application.bot.copy_message,
+                            chat_id=pair.destination_chat_id,
+                            from_chat_id=pair.source_chat_id,
+                            message_id=item["message_id"],
+                            reply_to_message_id=dest_reply_id,
+                            caption=enhanced_text if enhanced_text else None,
+                            parse_mode="HTML" if enhanced_text else None,
+                        )
+                        if copied_msg_id_obj:
+                            db.save_message_mapping(pair.name, item["message_id"], copied_msg_id_obj.message_id)
+
+                        logger.info(
+                            f"✅ [Pair: {pair.name}] Copied media message #{item['message_id']} "
+                            f"({'AI caption' if enhanced_text else 'original caption'}) to chat {pair.destination_chat_id}."
+                        )
+                    elif item["type"] == "album":
+                        copied_msgs = await self._call_with_retry(
+                            application.bot.copy_messages,
+                            chat_id=pair.destination_chat_id,
+                            from_chat_id=pair.source_chat_id,
+                            message_ids=item["message_ids"],
+                        )
+                        if copied_msgs and len(copied_msgs) == len(item["message_ids"]):
+                            for src_id, dst_msg in zip(item["message_ids"], copied_msgs):
+                                db.save_message_mapping(pair.name, src_id, dst_msg.message_id)
+
+                            if enhanced_text:
+                                try:
+                                    await application.bot.edit_message_caption(
+                                        chat_id=pair.destination_chat_id,
+                                        message_id=copied_msgs[0].message_id,
+                                        caption=enhanced_text,
+                                        parse_mode="HTML",
+                                    )
+                                except Exception as cap_err:
+                                    logger.debug(f"[Pair: {pair.name}] Could not apply AI caption to album: {cap_err}")
+
+                        logger.info(
+                            f"✅ [Pair: {pair.name}] Copied album messages {item['message_ids']} to chat {pair.destination_chat_id}."
+                        )
+                elif enhanced_text:
+                    sent_msg = await self._call_with_retry(
+                        application.bot.send_message,
                         chat_id=pair.destination_chat_id,
                         text=enhanced_text,
                         reply_to_message_id=dest_reply_id,
@@ -412,32 +483,19 @@ class TelegramCopierBot:
                         f"✨ [Pair: {pair.name}] Posted AI-sanitized message #{item['message_id']} to chat {pair.destination_chat_id}."
                     )
                 else:
-                    if item["type"] == "single":
-                        copied_msg_id_obj = await application.bot.copy_message(
-                            chat_id=pair.destination_chat_id,
-                            from_chat_id=pair.source_chat_id,
-                            message_id=item["message_id"],
-                            reply_to_message_id=dest_reply_id,
-                        )
-                        if copied_msg_id_obj:
-                            db.save_message_mapping(pair.name, item["message_id"], copied_msg_id_obj.message_id)
+                    copied_msg_id_obj = await self._call_with_retry(
+                        application.bot.copy_message,
+                        chat_id=pair.destination_chat_id,
+                        from_chat_id=pair.source_chat_id,
+                        message_id=item["message_id"],
+                        reply_to_message_id=dest_reply_id,
+                    )
+                    if copied_msg_id_obj:
+                        db.save_message_mapping(pair.name, item["message_id"], copied_msg_id_obj.message_id)
 
-                        logger.info(
-                            f"✅ [Pair: {pair.name}] Copied message #{item['message_id']} to chat {pair.destination_chat_id}."
-                        )
-                    elif item["type"] == "album":
-                        copied_msgs = await application.bot.copy_messages(
-                            chat_id=pair.destination_chat_id,
-                            from_chat_id=pair.source_chat_id,
-                            message_ids=item["message_ids"],
-                        )
-                        if copied_msgs and len(copied_msgs) == len(item["message_ids"]):
-                            for src_id, dst_msg in zip(item["message_ids"], copied_msgs):
-                                db.save_message_mapping(pair.name, src_id, dst_msg.message_id)
-
-                        logger.info(
-                            f"✅ [Pair: {pair.name}] Copied album messages {item['message_ids']} to chat {pair.destination_chat_id}."
-                        )
+                    logger.info(
+                        f"✅ [Pair: {pair.name}] Copied message #{item['message_id']} to chat {pair.destination_chat_id}."
+                    )
 
                 pair.last_processed_id = max_id
                 db.set_last_processed_id(pair.name, max_id)
@@ -608,6 +666,120 @@ class TelegramCopierBot:
         self.sync_classes_from_db()
         await update.message.reply_text("🧹 <b>Clean Slate Activated!</b> All class pairs have been deleted. You can now add your own explicit pairs from scratch using `/addclass`!", parse_mode="HTML")
 
+    async def backfill_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Bulk-migrate PAST/EXISTING messages already sitting in an old source channel into the
+        new destination channel. Real-time copying only reacts to messages posted while the bot is
+        running, so previously posted lesson materials need this explicit one-time migration."""
+        user = update.effective_user
+        if user:
+            self.is_user_admin(user.id)
+
+        args = context.args
+        if not args or len(args) < 3 or not args[-1].lstrip("-").isdigit() or not args[-2].lstrip("-").isdigit():
+            await update.message.reply_text(
+                "📦 <b>How to migrate old/previous materials into a new channel:</b>\n\n"
+                "Syntax: <code>/backfill ClassName start_id end_id</code>\n\n"
+                "<b>Example:</b>\n"
+                "<code>/backfill Mathematics 1 1 850</code>\n\n"
+                "<i>Tip: Open the OLD channel, right-click the first and last message you want to migrate, "
+                "and choose 'Copy Message Link'. The number at the end of each link is the message ID.</i>\n\n"
+                "⚠️ <b>Note:</b> Telegram's Bot API cannot read the *content* of old messages, only copy them "
+                "as-is. So AI cleanup/anonymization only runs on messages received live going forward — "
+                "backfilled posts keep their original captions untouched.",
+                parse_mode="HTML",
+            )
+            return
+
+        end_id = int(args[-1])
+        start_id = int(args[-2])
+        class_name = " ".join(args[:-2]).strip()
+
+        found_pair = self.find_pair_by_name(class_name)
+        if not found_pair:
+            await update.message.reply_text(f"❌ Class '<b>{class_name}</b>' not found.", parse_mode="HTML")
+            return
+
+        if start_id > end_id:
+            start_id, end_id = end_id, start_id
+
+        total = end_id - start_id + 1
+        if total > 3000:
+            await update.message.reply_text(
+                f"❌ Range too large ({total} messages). Please split into smaller batches (max 3000 per run)."
+            )
+            return
+
+        await update.message.reply_text(
+            f"📦 <b>Backfill started for {found_pair.name}!</b>\n"
+            f"Migrating message IDs <code>{start_id}</code>–<code>{end_id}</code> ({total} messages) "
+            f"from the old channel into <b>{found_pair.destination_title}</b>.\n\n"
+            f"You'll get progress updates here. This can take a while for large batches "
+            f"since it's paced to avoid Telegram's flood limits.",
+            parse_mode="HTML",
+        )
+
+        asyncio.create_task(
+            self._run_backfill(found_pair, start_id, end_id, update.effective_chat.id, context.application)
+        )
+
+    async def _run_backfill(
+        self, pair: ChannelPair, start_id: int, end_id: int, notify_chat_id: int, application
+    ) -> None:
+        """Worker that walks a historical message ID range and copies each into the destination,
+        pacing itself to stay under Telegram's flood-control limits and surviving transient errors."""
+        copied = 0
+        skipped = 0
+        failed = 0
+        total = end_id - start_id + 1
+
+        logger.info(f"[Backfill:{pair.name}] Starting migration of IDs {start_id}-{end_id} ({total} messages).")
+
+        for msg_id in range(start_id, end_id + 1):
+            try:
+                result = await self._call_with_retry(
+                    application.bot.copy_message,
+                    chat_id=pair.destination_chat_id,
+                    from_chat_id=pair.source_chat_id,
+                    message_id=msg_id,
+                )
+                if result:
+                    db.save_message_mapping(pair.name, msg_id, result.message_id)
+                    copied += 1
+            except BadRequest as e:
+                # Expected for gaps: deleted messages, service messages, or IDs that never existed.
+                skipped += 1
+                logger.debug(f"[Backfill:{pair.name}] Skipped ID {msg_id}: {e}")
+            except Exception as e:
+                failed += 1
+                logger.warning(f"[Backfill:{pair.name}] Failed ID {msg_id}: {e}")
+
+            done = copied + skipped + failed
+            if done % 25 == 0 or done == total:
+                try:
+                    await application.bot.send_message(
+                        notify_chat_id,
+                        f"⏳ <b>{pair.name} backfill progress:</b> {done}/{total} processed "
+                        f"(✅ {copied} copied, ⏭️ {skipped} skipped, ❌ {failed} failed)",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+
+            await asyncio.sleep(random.uniform(2.5, 4.5))
+
+        logger.info(f"[Backfill:{pair.name}] Finished. Copied={copied} Skipped={skipped} Failed={failed}")
+        try:
+            await application.bot.send_message(
+                notify_chat_id,
+                f"🎉 <b>Backfill complete for {pair.name}!</b>\n\n"
+                f"✅ Copied: {copied}\n⏭️ Skipped (not found/deleted): {skipped}\n❌ Failed: {failed}",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
     async def handle_admin_conversational_chat(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -710,6 +882,10 @@ class TelegramCopierBot:
 
         msg_text = message.text or message.caption or ""
         reply_to_id = message.reply_to_message.message_id if message.reply_to_message else None
+        has_media = bool(
+            message.photo or message.video or message.document or message.audio
+            or message.voice or message.animation or message.video_note or message.sticker
+        )
 
         if message.photo and os.getenv("GEMINI_API_KEY"):
             try:
@@ -758,6 +934,7 @@ class TelegramCopierBot:
                     "max_id": message.message_id,
                     "text": sanitized_msg_text,
                     "reply_to_message_id": reply_to_id,
+                    "has_media": has_media,
                 })
                 logger.info(
                     f"📥 [Pair: {pair.name}] Message #{message.message_id} queued for copying."
@@ -804,6 +981,7 @@ class TelegramCopierBot:
             "• <code>/pairs</code> (View explicit FROM ➔ TO flow)\n\n"
             "👇 <b>Quick Commands Menu:</b>\n"
             "• /addclass - Add an explicit FROM ➔ TO channel pair\n"
+            "• /backfill - Migrate previously posted materials from an old channel\n"
             "• /pairs - View explicit FROM ➔ TO channel pair flows\n"
             "• /deleteclass - Delete a channel pair\n"
             "• /clearallclasses - Wipe all channel pairs\n"
@@ -1007,6 +1185,9 @@ class TelegramCopierBot:
             "Tell the AI in chat or use <code>/addclass ClassName source_id dest_id [discussion_id]</code>\n\n"
             "<b>2. View Explicit Pair Flows (FROM ➔ TO):</b>\n"
             "Use <code>/pairs</code> or <code>/start</code>\n\n"
+            "<b>2b. Migrate Previously Posted Materials:</b>\n"
+            "New pairs only copy messages posted while the bot is running. To bring over materials "
+            "already sitting in an old channel, use <code>/backfill ClassName start_id end_id</code>.\n\n"
             "<b>3. Delete Any Channel Pair:</b>\n"
             "Tell the AI in chat or use <code>/deleteclass ClassName</code>\n\n"
             "<b>4. Wipe All Classes to Start Fresh:</b>\n"
@@ -1296,6 +1477,7 @@ class TelegramCopierBot:
         commands = [
             BotCommand("start", "Explicit pair location overview"),
             BotCommand("addclass", "Add explicit FROM ➔ TO channel pair"),
+            BotCommand("backfill", "Migrate old/existing messages into new channel"),
             BotCommand("pairs", "View explicit FROM ➔ TO channel pairs"),
             BotCommand("deleteclass", "Delete a channel pair"),
             BotCommand("clearallclasses", "Wipe all channel pairs"),
@@ -1338,6 +1520,7 @@ class TelegramCopierBot:
         application.add_handler(CommandHandler("start", self.start_command))
         application.add_handler(CommandHandler("help", self.help_command))
         application.add_handler(CommandHandler("addclass", self.addclass_command))
+        application.add_handler(CommandHandler("backfill", self.backfill_command))
         application.add_handler(CommandHandler("deleteclass", self.deleteclass_command))
         application.add_handler(CommandHandler("clearallclasses", self.clearallclasses_command))
         application.add_handler(CommandHandler("logs", self.logs_command))

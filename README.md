@@ -22,6 +22,7 @@ A production-ready Telegram bot written in Python using `python-telegram-bot` (v
 Once your bot is running, open a chat with your bot in Telegram to use these commands:
 
 - **`/start`** – Shows welcome message and quick menu overview.
+- **`/backfill <Subject> start_id end_id`** – Migrates messages already sitting in an old source channel (posted before the bot was watching) into the new destination channel. Real-time copying only reacts to messages posted while the bot is running, so previously posted lesson materials need this one-time migration. Note: old captions are copied as-is since the Bot API can't read historical message content for AI cleanup.
 - **`/pairs`** – Displays detailed status, channel IDs, message spacing, and last copied message ID.
 - **`/schedule`** – Displays your weekly class schedule timetable for all 5 subjects.
 - **`/setdelay <Subject> <seconds>`** – Dictate message spacing directly in Telegram (e.g. `/setdelay Biology 180` sets 3-minute spacing).
