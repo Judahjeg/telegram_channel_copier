@@ -80,6 +80,11 @@ class ChannelPair:
         self.discussion_chat_id: Optional[int] = int(config["discussion_chat_id"]) if config.get("discussion_chat_id") else None
         self.start_message_id: int = config.get("start_message_id", 1)
 
+        # Explicit Channel Titles for clear "FROM ➔ TO" display
+        self.source_title: str = config.get("source_title", f"Source Channel ({self.source_chat_id})")
+        self.destination_title: str = config.get("destination_title", f"Destination Channel ({self.destination_chat_id})")
+        self.discussion_title: str = config.get("discussion_title", f"Discussion Group ({self.discussion_chat_id})" if self.discussion_chat_id else "None")
+
         # Message Spacing / Delay settings (in seconds)
         self.delay_min_seconds: float = float(config.get("delay_min_seconds", 120.0))
         self.delay_max_seconds: float = float(config.get("delay_max_seconds", 240.0))
@@ -114,8 +119,18 @@ class ChannelPair:
         self.pending_albums: Dict[str, Dict[str, Any]] = {}
 
         logger.info(
-            f"[Pair: {self.name}] Loaded pair. Spacing: {self.delay_min_seconds:.0f}-{self.delay_max_seconds:.0f}s. "
-            f"AI Mode: '{self.ai_mode}'. Last processed msg ID: {self.last_processed_id}"
+            f"[Pair: {self.name}] Loaded pair. FROM {self.source_chat_id} ➔ TO {self.destination_chat_id}. "
+            f"Spacing: {self.delay_min_seconds:.0f}-{self.delay_max_seconds:.0f}s."
+        )
+
+    def get_explicit_flow_description(self) -> str:
+        """Explicit description showing FROM source ➔ TO destination."""
+        disc_str = f"\n  💬 <b>Discussion Group:</b> {self.discussion_title} (<code>{self.discussion_chat_id}</code>)" if self.discussion_chat_id else ""
+        return (
+            f"• <b>{self.name} Pair Flow:</b>\n"
+            f"  📤 <b>FROM (Source):</b> {self.source_title} (ID: <code>{self.source_chat_id}</code>)\n"
+            f"  📥 <b>TO (Destination):</b> {self.destination_title} (ID: <code>{self.destination_chat_id}</code>)"
+            f"{disc_str}"
         )
 
     def check_is_active(self, now: Optional[datetime.datetime] = None) -> bool:
@@ -162,11 +177,36 @@ class TelegramCopierBot:
         self.admin_user_ids: Set[int] = set()
         self.application = None
 
+    async def update_pair_titles(self, pair: ChannelPair) -> None:
+        """Fetch official chat titles from Telegram API so pairs display exact channel names."""
+        if not self.application or not self.application.bot:
+            return
+        try:
+            s_chat = await self.application.bot.get_chat(pair.source_chat_id)
+            if s_chat and s_chat.title:
+                pair.source_title = s_chat.title
+        except Exception as e:
+            logger.debug(f"Source chat title fetch note: {e}")
+
+        try:
+            d_chat = await self.application.bot.get_chat(pair.destination_chat_id)
+            if d_chat and d_chat.title:
+                pair.destination_title = d_chat.title
+        except Exception as e:
+            logger.debug(f"Dest chat title fetch note: {e}")
+
+        if pair.discussion_chat_id:
+            try:
+                disc_chat = await self.application.bot.get_chat(pair.discussion_chat_id)
+                if disc_chat and disc_chat.title:
+                    pair.discussion_title = disc_chat.title
+            except Exception as e:
+                logger.debug(f"Disc chat title fetch note: {e}")
+
     def sync_classes_from_db(self) -> None:
         """Load and synchronize dynamic class configurations from SQLite database into memory maps."""
         db_classes = db.get_all_dynamic_classes()
 
-        # Re-build memory maps
         self.source_map.clear()
         self.discussion_map.clear()
 
@@ -187,6 +227,7 @@ class TelegramCopierBot:
                 pair = ChannelPair(p_cfg)
                 if self.application:
                     pair.worker_task = asyncio.create_task(self.pair_worker_loop(pair, self.application))
+                    asyncio.create_task(self.update_pair_titles(pair))
 
             new_pairs.append(pair)
 
@@ -218,11 +259,8 @@ class TelegramCopierBot:
                     raw_admins.append(int(aid))
 
         self.admin_user_ids = set(raw_admins)
-        
-        # Wipe all default classes as requested by user
-        db.clear_all_dynamic_classes()
         self.sync_classes_from_db()
-        logger.info(f"Clean slate active. Loaded {len(self.pairs)} channel pairs and {len(self.admin_user_ids)} bot admins.")
+        logger.info(f"Loaded {len(self.pairs)} channel pairs and {len(self.admin_user_ids)} bot admins.")
 
     def find_pair_by_name(self, search_term: str) -> Optional[ChannelPair]:
         """Flexible name lookup supporting exact match and partial fuzzy match."""
@@ -252,14 +290,16 @@ class TelegramCopierBot:
         return user_id in self.admin_user_ids
 
     def get_classes_summary(self) -> str:
-        """Generate summary string of all classes for the AI assistant."""
+        """Generate summary string of all classes for the AI assistant with explicit FROM ➔ TO detail."""
         if not self.pairs:
             return "No active classes right now. The administrator has a clean slate."
         lines = []
         for p in self.pairs:
             cp = db.get_custom_prompt(p.name)
             cp_str = f"Prompt: '{cp}'" if cp else "Prompt: default"
-            lines.append(f"- Class: {p.name} | Source: {p.source_chat_id} | Dest: {p.destination_chat_id} | Discussion: {p.discussion_chat_id} | Spacing: {p.delay_min_seconds:.0f}s | Active: {p.is_active} | {cp_str}")
+            lines.append(
+                f"- Class: {p.name} | FROM Source '{p.source_title}' ({p.source_chat_id}) ➔ TO Dest '{p.destination_title}' ({p.destination_chat_id}) | Spacing: {p.delay_min_seconds:.0f}s | Active: {p.is_active} | {cp_str}"
+            )
         return "\n".join(lines)
 
     async def activation_checker_loop(self) -> None:
@@ -460,11 +500,11 @@ class TelegramCopierBot:
         args = context.args
         if not args or len(args) < 3:
             await update.message.reply_text(
-                "➕ <b>How to Add/Set a Custom Class Channel:</b>\n\n"
+                "➕ <b>How to Add/Set a Custom Class Pair:</b>\n\n"
                 "Syntax: <code>/addclass ClassName SourceChatID DestinationChatID [DiscussionChatID]</code>\n\n"
                 "<b>Example:</b>\n"
                 "<code>/addclass Mathematics 1 -100123456789 -100987654321 -100555444333</code>\n\n"
-                "<i>Tip: You can also just tell the AI in private chat: 'Add a new class called Mathematics 1 with source -100123... and dest -100987...'</i>",
+                "<i>Tip: You can also just tell the AI in private chat: 'Add a new class called Mathematics 1 from source -100123... to destination -100987...'</i>",
                 parse_mode="HTML",
             )
             return
@@ -488,12 +528,13 @@ class TelegramCopierBot:
             )
             self.sync_classes_from_db()
 
-            disc_str = f" | Discussion: <code>{disc_id}</code>" if disc_id else ""
+            disc_str = f"\n💬 <b>Discussion Group:</b> <code>{disc_id}</code>" if disc_id else ""
             await update.message.reply_text(
-                f"🎉 <b>Success!</b> Custom Class <b>{c_name}</b> has been set up!\n\n"
-                f"• Source ID: <code>{source_id}</code>\n"
-                f"• Destination ID: <code>{dest_id}</code>{disc_str}\n"
-                f"• Status: 🟢 Active and listening now!",
+                f"🎉 <b>Explicit Pair Configured!</b>\n\n"
+                f"📚 <b>Class Name:</b> <b>{c_name}</b>\n"
+                f"📤 <b>FROM (Source Channel):</b> <code>{source_id}</code>\n"
+                f"📥 <b>TO (Destination Channel):</b> <code>{dest_id}</code>{disc_str}\n\n"
+                f"🟢 Status: Connected & listening live now!",
                 parse_mode="HTML",
             )
         except ValueError:
@@ -517,7 +558,7 @@ class TelegramCopierBot:
         deleted = db.delete_dynamic_class(target_name)
         if deleted:
             self.sync_classes_from_db()
-            await update.message.reply_text(f"🗑️ <b>Deleted!</b> Class channel <b>{target_name}</b> was removed successfully.", parse_mode="HTML")
+            await update.message.reply_text(f"🗑️ <b>Deleted!</b> Class channel pair <b>{target_name}</b> was removed successfully.", parse_mode="HTML")
         else:
             await update.message.reply_text(f"❌ Class <b>{target_name}</b> not found.", parse_mode="HTML")
 
@@ -532,7 +573,7 @@ class TelegramCopierBot:
 
         db.clear_all_dynamic_classes()
         self.sync_classes_from_db()
-        await update.message.reply_text("🧹 <b>Clean Slate Activated!</b> All default and custom classes have been deleted. You can now add your own classes from scratch using `/addclass`!", parse_mode="HTML")
+        await update.message.reply_text("🧹 <b>Clean Slate Activated!</b> All class pairs have been deleted. You can now add your own explicit pairs from scratch using `/addclass`!", parse_mode="HTML")
 
     async def handle_admin_conversational_chat(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -705,40 +746,36 @@ class TelegramCopierBot:
 
         channel_locations = []
         for p in self.pairs:
-            disc_str = f" | Discussion ID: <code>{p.discussion_chat_id}</code>" if p.discussion_chat_id else ""
-            channel_locations.append(
-                f"• <b>{p.name}:</b> Source <code>{p.source_chat_id}</code> ➔ Destination <code>{p.destination_chat_id}</code>{disc_str}"
-            )
+            channel_locations.append(p.get_explicit_flow_description())
 
-        locations_block = "\n".join(channel_locations) if channel_locations else "<i>No classes connected yet. Use /addclass to add your first class!</i>"
+        locations_block = "\n\n".join(channel_locations) if channel_locations else "<i>No class pairs connected yet. Use /addclass to add your first explicit pair!</i>"
 
         msg = (
             f"🧙‍♂️ <b>Welcome to Iconic Impact Tutor AI Co-Pilot, {user.first_name if user else 'User'}!</b>\n\n"
             f"Your Telegram User ID: <code>{user.id if user else 'Unknown'}</code>\n\n"
-            "✨ <b>Clean Slate Active!</b> All default classes have been removed. You can now set up your own classes from scratch!\n\n"
-            f"📍 <b>Where Bot is Currently Added & Active:</b>\n"
+            "✨ <b>Explicit Pair Setup Active!</b> Configure explicit pairs showing exactly FROM which source channel TO which destination channel content flows.\n\n"
+            f"📍 <b>Explicit Connected Channel Pairs:</b>\n"
             f"{locations_block}\n\n"
             f"📊 <b>Bot Overview:</b>\n"
-            f"• <b>Total Connected Classes:</b> {len(self.pairs)}\n"
+            f"• <b>Total Connected Pairs:</b> {len(self.pairs)}\n"
             f"• 🟢 <b>Active Right Now:</b> {active_count}\n"
-            f"• 🛠️ <b>Dynamic Class Setup:</b> 🟢 Active (`/addclass` & `/deleteclass`)\n"
+            f"• 🛠️ <b>Explicit Pair Setup:</b> 🟢 Active (`/addclass` & `/deleteclass`)\n"
             f"• 💬 <b>Conversational AI Co-Pilot:</b> 🟢 Active\n"
             f"• 📜 <b>Student Interaction Logs:</b> 🟢 Active (`/logs`)\n"
             f"• 🤖 <b>AI Engine:</b> {has_ai}\n\n"
             "💬 <b>Chat with me naturally or run commands:</b>\n"
             "• <code>/addclass ClassName SourceChatID DestinationChatID</code>\n"
-            "• <i>'Add a class called Further Maths with source -100123 and dest -100456'</i>\n"
-            "• <code>/deleteclass ClassName</code>\n"
-            "• <code>/clearallclasses</code> (Wipe all classes)\n\n"
+            "• <i>'Add a class called Further Maths from source -100123 to dest -100456'</i>\n"
+            "• <code>/pairs</code> (View explicit FROM ➔ TO flow)\n\n"
             "👇 <b>Quick Commands Menu:</b>\n"
-            "• /addclass - Add/Set up a new custom class channel\n"
-            "• /deleteclass - Delete a class channel\n"
-            "• /clearallclasses - Wipe all classes to start over\n"
+            "• /addclass - Add an explicit FROM ➔ TO channel pair\n"
+            "• /pairs - View explicit FROM ➔ TO channel pair flows\n"
+            "• /deleteclass - Delete a channel pair\n"
+            "• /clearallclasses - Wipe all channel pairs\n"
             "• /logs - View recent student Q&A interaction logs\n"
             "• /schedule - View & manage weekly class timetables\n"
             "• /quiz - Generate interactive quiz for a class\n"
             "• /summary - Generate weekly master study guide\n"
-            "• /pairs - View connected channels & spacing\n"
             "• /prompt - Set custom AI instructions\n"
             "• /setdelay - Dictate message spacing\n"
             "• /activate - Toggle class active state\n"
@@ -881,7 +918,7 @@ class TelegramCopierBot:
                 lines.append(f"• <b>{p.name}:</b> {cp_str}")
 
             if not self.pairs:
-                lines.append("<i>No active classes. Use /addclass to add your first class!</i>")
+                lines.append("<i>No active classes. Use /addclass to add your first explicit pair!</i>")
 
             await update.message.reply_text("\n".join(lines), parse_mode="HTML")
             return
@@ -933,15 +970,15 @@ class TelegramCopierBot:
     ) -> None:
         """Explanatory guide."""
         msg = (
-            "📖 <b>Dynamic Class Setup & Conversational AI Guide</b>\n\n"
-            "<b>1. Add / Set Up Any Class Channel:</b>\n"
+            "📖 <b>Explicit Channel Pair Setup & Conversational AI Guide</b>\n\n"
+            "<b>1. Add / Set Up Explicit Channel Pair:</b>\n"
             "Tell the AI in chat or use <code>/addclass ClassName source_id dest_id [discussion_id]</code>\n\n"
-            "<b>2. Delete Any Class Channel:</b>\n"
+            "<b>2. View Explicit Pair Flows (FROM ➔ TO):</b>\n"
+            "Use <code>/pairs</code> or <code>/start</code>\n\n"
+            "<b>3. Delete Any Channel Pair:</b>\n"
             "Tell the AI in chat or use <code>/deleteclass ClassName</code>\n\n"
-            "<b>3. Wipe All Classes to Start Fresh:</b>\n"
+            "<b>4. Wipe All Classes to Start Fresh:</b>\n"
             "Use <code>/clearallclasses</code>\n\n"
-            "<b>4. Priority Lesson Notes Search:</b>\n"
-            "AI tutor scans class channel notes first before external knowledge.\n\n"
             "<b>5. Student Interaction Logs (`/logs`):</b>\n"
             "View recent student questions and AI answers."
         )
@@ -963,10 +1000,10 @@ class TelegramCopierBot:
             "⚙️ <b>Bot System Dashboard</b>\n\n"
             f"• <b>Status:</b> 🟢 Running smoothly\n"
             f"• <b>Uptime:</b> {hours}h {minutes}m {seconds}s\n"
-            f"• <b>Total Class Channels:</b> {len(self.pairs)}\n"
+            f"• <b>Total Explicit Channel Pairs:</b> {len(self.pairs)}\n"
             f"• 🟢 <b>Active Right Now:</b> {len(active_pairs)}\n"
             f"• 📬 <b>Messages Queued:</b> {total_queued}\n"
-            f"• 🛠️ <b>Dynamic Class Setup:</b> 🟢 Enabled (`/addclass` & `/deleteclass`)\n"
+            f"• 🛠️ <b>Explicit Pair Setup:</b> 🟢 Enabled (`/addclass` & `/pairs`)\n"
             f"• 💬 <b>Conversational AI Co-Pilot:</b> 🟢 Enabled\n"
             f"• 🛡️ <b>Anonymization & Vision OCR:</b> 🟢 Enabled\n"
             f"• 📜 <b>Student Interaction Logs:</b> 🟢 Enabled (`/logs`)\n"
@@ -979,12 +1016,12 @@ class TelegramCopierBot:
     async def pairs_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Detailed status of all subject pairs."""
+        """Detailed status of all subject pairs with explicit FROM ➔ TO detail."""
         if not self.pairs:
-            await update.message.reply_text("No channel pairs configured. Use `/addclass ClassName source_id dest_id` to add one!", parse_mode="HTML")
+            await update.message.reply_text("No channel pairs configured. Use `/addclass ClassName source_id dest_id` to add your first explicit pair!", parse_mode="HTML")
             return
 
-        lines = ["📚 <b>Exact Class Channels, Locations & Spacing:</b>\n"]
+        lines = ["📚 <b>Explicit Channel Pairs (FROM ➔ TO Flow):</b>\n"]
         for p in self.pairs:
             status_icon = "🟢 <b>ACTIVE</b>" if p.is_active else "⏳ <b>DORMANT</b>"
             q_size = p.queue.qsize()
@@ -996,21 +1033,20 @@ class TelegramCopierBot:
             else:
                 spacing_str = f"{p.delay_min_seconds:.0f}–{p.delay_max_seconds:.0f} sec"
 
-            disc_info = f"<code>{p.discussion_chat_id}</code>" if p.discussion_chat_id else "None"
+            disc_info = f"<code>{p.discussion_chat_id}</code> ({p.discussion_title})" if p.discussion_chat_id else "None"
 
             lines.append(
-                f"<b>Class: {p.name}</b>\n"
+                f"<b>Pair: {p.name}</b>\n"
                 f"• Status: {status_icon}\n"
-                f"• Spacing: ⏱️ <b>{spacing_str}</b>\n"
-                f"• AI Settings: 🤖 {prompt_summary}\n"
-                f"• Source Channel ID: <code>{p.source_chat_id}</code>\n"
-                f"• Destination Channel ID: <code>{p.destination_chat_id}</code>\n"
-                f"• Discussion Group ID: {disc_info}\n"
-                f"• Last Copied Msg ID: <code>{p.last_processed_id}</code>\n"
-                f"• Queue Backlog: {q_size} pending\n"
+                f"• 📤 <b>FROM (Source):</b> {p.source_title} (<code>{p.source_chat_id}</code>)\n"
+                f"• 📥 <b>TO (Destination):</b> {p.destination_title} (<code>{p.destination_chat_id}</code>)\n"
+                f"• 💬 <b>Discussion Group:</b> {disc_info}\n"
+                f"• ⏱️ Message Spacing: <b>{spacing_str}</b>\n"
+                f"• 🤖 AI Mode: {prompt_summary}\n"
+                f"• 📬 Queue Backlog: {q_size} pending\n"
             )
 
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        await update.message.reply_text("\n---\n".join(lines), parse_mode="HTML")
 
     async def schedule_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1229,14 +1265,14 @@ class TelegramCopierBot:
         self.application = application
 
         commands = [
-            BotCommand("start", "Location overview & AI setup wizard"),
-            BotCommand("addclass", "Add/set up a new custom class channel"),
-            BotCommand("deleteclass", "Delete a class channel"),
-            BotCommand("clearallclasses", "Wipe all classes to start over"),
+            BotCommand("start", "Explicit pair location overview"),
+            BotCommand("addclass", "Add explicit FROM ➔ TO channel pair"),
+            BotCommand("pairs", "View explicit FROM ➔ TO channel pairs"),
+            BotCommand("deleteclass", "Delete a channel pair"),
+            BotCommand("clearallclasses", "Wipe all channel pairs"),
             BotCommand("logs", "View student Q&A interaction logs"),
             BotCommand("quiz", "Generate interactive practice quiz poll"),
             BotCommand("summary", "Generate weekly master study guide"),
-            BotCommand("pairs", "View connected channels & spacing"),
             BotCommand("prompt", "Set custom AI instructions per class"),
             BotCommand("setdelay", "Dictate message spacing per class"),
             BotCommand("schedule", "View weekly class timetables"),
@@ -1251,6 +1287,7 @@ class TelegramCopierBot:
             pair.worker_task = asyncio.create_task(
                 self.pair_worker_loop(pair, application)
             )
+            asyncio.create_task(self.update_pair_titles(pair))
 
         asyncio.create_task(self.activation_checker_loop())
 
