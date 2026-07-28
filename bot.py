@@ -12,6 +12,8 @@ import socketserver
 import sys
 import threading
 import time
+import urllib.request
+import urllib.error
 from typing import Dict, List, Any, Optional, Set
 
 from telegram import Update, BotCommand
@@ -47,7 +49,7 @@ def start_dummy_web_server():
             self.send_response(200)
             self.send_header("Content-type", "text/plain")
             self.end_headers()
-            self.wfile.write(b"Iconic Impact Tutor Bot is running live!")
+            self.wfile.write(b"Iconic Impact Tutor Bot is running live 24/7!")
 
         def log_message(self, format, *args):
             pass
@@ -62,6 +64,34 @@ def start_dummy_web_server():
 
     thread = threading.Thread(target=run_server, daemon=True)
     thread.start()
+
+
+def start_self_keep_alive_loop():
+    """24/7 Automated Self-Keeper Loop: Pings the server every 3 minutes to prevent Render from sleeping."""
+    def ping_loop():
+        time.sleep(10)
+        port = int(os.getenv("PORT", "8080"))
+        render_url = os.getenv("RENDER_EXTERNAL_URL", "")
+
+        while True:
+            try:
+                req = urllib.request.Request(f"http://127.0.0.1:{port}/", headers={"User-Agent": "SelfKeepAlive/1.0"})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    pass
+
+                if render_url:
+                    req_ext = urllib.request.Request(render_url, headers={"User-Agent": "SelfKeepAlive/1.0"})
+                    with urllib.request.urlopen(req_ext, timeout=10) as resp_ext:
+                        pass
+                logger.debug("⏱️ [Keep-Alive] 24/7 self-ping successful. Container active.")
+            except Exception as e:
+                logger.debug(f"[Keep-Alive] Ping note: {e}")
+
+            time.sleep(180)  # Ping every 3 minutes (180 seconds)
+
+    thread = threading.Thread(target=ping_loop, daemon=True)
+    thread.start()
+    logger.info("⚡ [Keep-Alive Engine] 24/7 automated ping loop activated (3 min interval).")
 
 
 def parse_iso_datetime(dt_str: str) -> datetime.datetime:
@@ -290,8 +320,7 @@ class TelegramCopierBot:
             return True
         if user_id in self.admin_user_ids:
             return True
-        
-        # Auto-authorize any user interacting with the bot in private chat
+
         self.admin_user_ids.add(user_id)
         logger.info(f"Auto-authorized Telegram User ID {user_id} as Bot Admin.")
         return True
@@ -589,7 +618,6 @@ class TelegramCopierBot:
         if not message or not user or not message.text:
             return
 
-        # Auto-register user as admin so they are never denied access
         self.is_user_admin(user.id)
 
         classes_summary = self.get_classes_summary()
@@ -765,6 +793,7 @@ class TelegramCopierBot:
             f"📊 <b>Bot Overview:</b>\n"
             f"• <b>Total Connected Pairs:</b> {len(self.pairs)}\n"
             f"• 🟢 <b>Active Right Now:</b> {active_count}\n"
+            f"• ⚡ <b>24/7 Keep-Alive Engine:</b> 🟢 Active (Always Awake)\n"
             f"• 🛠️ <b>Explicit Pair Setup:</b> 🟢 Active (`/addclass` & `/deleteclass`)\n"
             f"• 💬 <b>Conversational AI Co-Pilot:</b> 🟢 Active\n"
             f"• 📜 <b>Student Interaction Logs:</b> 🟢 Active (`/logs`)\n"
@@ -1006,6 +1035,7 @@ class TelegramCopierBot:
             f"• <b>Total Explicit Channel Pairs:</b> {len(self.pairs)}\n"
             f"• 🟢 <b>Active Right Now:</b> {len(active_pairs)}\n"
             f"• 📬 <b>Messages Queued:</b> {total_queued}\n"
+            f"• ⚡ <b>24/7 Keep-Alive Engine:</b> 🟢 Active (Always Awake)\n"
             f"• 🛠️ <b>Explicit Pair Setup:</b> 🟢 Enabled (`/addclass` & `/pairs`)\n"
             f"• 💬 <b>Conversational AI Co-Pilot:</b> 🟢 Enabled\n"
             f"• 🛡️ <b>Anonymization & Vision OCR:</b> 🟢 Enabled\n"
@@ -1260,7 +1290,7 @@ class TelegramCopierBot:
     # ------------------------------------------------------------------
 
     async def post_init(self, application) -> None:
-        """Start worker loops, scheduler, and register bot commands menu."""
+        """Start worker loops, scheduler, keep-alive engine, and register bot commands menu."""
         self.application = application
 
         commands = [
@@ -1332,6 +1362,7 @@ class TelegramCopierBot:
 
 if __name__ == "__main__":
     start_dummy_web_server()
+    start_self_keep_alive_loop()
 
     bot_token = os.getenv("BOT_TOKEN")
     if not bot_token:
