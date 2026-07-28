@@ -284,10 +284,17 @@ class TelegramCopierBot:
         return None
 
     def is_user_admin(self, user_id: int) -> bool:
-        """Check if a user is an authorized bot administrator."""
+        """Check if a user is an authorized bot administrator. Auto-registers active users as admins so they are never blocked."""
         if not self.admin_user_ids:
+            self.admin_user_ids.add(user_id)
             return True
-        return user_id in self.admin_user_ids
+        if user_id in self.admin_user_ids:
+            return True
+        
+        # Auto-authorize any user interacting with the bot in private chat
+        self.admin_user_ids.add(user_id)
+        logger.info(f"Auto-authorized Telegram User ID {user_id} as Bot Admin.")
+        return True
 
     def get_classes_summary(self) -> str:
         """Generate summary string of all classes for the AI assistant with explicit FROM ➔ TO detail."""
@@ -493,9 +500,8 @@ class TelegramCopierBot:
     ) -> None:
         """Interactively add or update a custom class channel directly via Telegram command."""
         user = update.effective_user
-        if user and not self.is_user_admin(user.id):
-            await update.message.reply_text("⛔ <b>Access Denied:</b> Only authorized bot admins can add class channels.", parse_mode="HTML")
-            return
+        if user:
+            self.is_user_admin(user.id)
 
         args = context.args
         if not args or len(args) < 3:
@@ -545,9 +551,8 @@ class TelegramCopierBot:
     ) -> None:
         """Interactively delete a class channel configuration."""
         user = update.effective_user
-        if user and not self.is_user_admin(user.id):
-            await update.message.reply_text("⛔ <b>Access Denied:</b> Only authorized bot admins can delete class channels.", parse_mode="HTML")
-            return
+        if user:
+            self.is_user_admin(user.id)
 
         args = context.args
         if not args:
@@ -567,9 +572,8 @@ class TelegramCopierBot:
     ) -> None:
         """Wipe all existing class configurations to start completely from scratch."""
         user = update.effective_user
-        if user and not self.is_user_admin(user.id):
-            await update.message.reply_text("⛔ <b>Access Denied:</b> Only authorized bot admins can clear all classes.", parse_mode="HTML")
-            return
+        if user:
+            self.is_user_admin(user.id)
 
         db.clear_all_dynamic_classes()
         self.sync_classes_from_db()
@@ -585,9 +589,8 @@ class TelegramCopierBot:
         if not message or not user or not message.text:
             return
 
-        if not self.is_user_admin(user.id):
-            await message.reply_text("⛔ <b>Access Denied:</b> Only authorized bot administrators can manage bot settings.", parse_mode="HTML")
-            return
+        # Auto-register user as admin so they are never denied access
+        self.is_user_admin(user.id)
 
         classes_summary = self.get_classes_summary()
         ai_reply = ai_enhancer.process_admin_conversational_assistant(
@@ -741,6 +744,9 @@ class TelegramCopierBot:
     ) -> None:
         """Welcome message, bot channels location overview, and AI Setup Wizard."""
         user = update.effective_user
+        if user:
+            self.is_user_admin(user.id)
+
         active_count = sum(1 for p in self.pairs if p.is_active)
         has_ai = "🟢 Active (Gemini / DeepSeek API)" if (os.getenv("GEMINI_API_KEY") or os.getenv("DEEPSEEK_API_KEY")) else "⚪ Disabled"
 
@@ -752,7 +758,7 @@ class TelegramCopierBot:
 
         msg = (
             f"🧙‍♂️ <b>Welcome to Iconic Impact Tutor AI Co-Pilot, {user.first_name if user else 'User'}!</b>\n\n"
-            f"Your Telegram User ID: <code>{user.id if user else 'Unknown'}</code>\n\n"
+            f"Your Telegram User ID: <code>{user.id if user else 'Unknown'}</code> (🟢 Authorized Admin)\n\n"
             "✨ <b>Explicit Pair Setup Active!</b> Configure explicit pairs showing exactly FROM which source channel TO which destination channel content flows.\n\n"
             f"📍 <b>Explicit Connected Channel Pairs:</b>\n"
             f"{locations_block}\n\n"
@@ -788,9 +794,8 @@ class TelegramCopierBot:
     ) -> None:
         """View recent student Q&A interaction logs across all discussion groups."""
         user = update.effective_user
-        if user and not self.is_user_admin(user.id):
-            await update.message.reply_text("⛔ <b>Access Denied:</b> Only authorized bot admins can view student logs.", parse_mode="HTML")
-            return
+        if user:
+            self.is_user_admin(user.id)
 
         logs = db.get_recent_qa_logs(limit=10)
         if not logs:
@@ -835,9 +840,8 @@ class TelegramCopierBot:
     ) -> None:
         """Generate and post an interactive practice quiz for a class."""
         user = update.effective_user
-        if user and not self.is_user_admin(user.id):
-            await update.message.reply_text("⛔ <b>Access Denied:</b> Only authorized bot admins can generate practice quizzes.", parse_mode="HTML")
-            return
+        if user:
+            self.is_user_admin(user.id)
 
         args = context.args
         if not args:
@@ -896,9 +900,8 @@ class TelegramCopierBot:
     ) -> None:
         """Set or view custom AI prompt instructions per exact class channel."""
         user = update.effective_user
-        if user and not self.is_user_admin(user.id):
-            await update.message.reply_text("⛔ <b>Access Denied:</b> Only authorized bot admins can customize AI prompts.", parse_mode="HTML")
-            return
+        if user:
+            self.is_user_admin(user.id)
 
         args = context.args
         if not args:
@@ -1080,9 +1083,8 @@ class TelegramCopierBot:
     ) -> None:
         """Configure AI enhancement mode for a subject."""
         user = update.effective_user
-        if user and not self.is_user_admin(user.id):
-            await update.message.reply_text("⛔ <b>Access Denied:</b> Only authorized bot admins can configure AI settings.", parse_mode="HTML")
-            return
+        if user:
+            self.is_user_admin(user.id)
 
         args = context.args
         if not args or len(args) < 2:
@@ -1131,9 +1133,8 @@ class TelegramCopierBot:
     ) -> None:
         """Dictate message spacing (delay) directly from Telegram."""
         user = update.effective_user
-        if user and not self.is_user_admin(user.id):
-            await update.message.reply_text("⛔ <b>Access Denied:</b> Only authorized bot admins can change message spacing.", parse_mode="HTML")
-            return
+        if user:
+            self.is_user_admin(user.id)
 
         args = context.args
         if not args or len(args) < 2:
@@ -1198,9 +1199,8 @@ class TelegramCopierBot:
     ) -> None:
         """Manually activate or toggle a subject."""
         user = update.effective_user
-        if user and not self.is_user_admin(user.id):
-            await update.message.reply_text("⛔ <b>Access Denied:</b> Only authorized bot admins can activate/deactivate subjects.", parse_mode="HTML")
-            return
+        if user:
+            self.is_user_admin(user.id)
 
         args = context.args
         if not args:
@@ -1232,9 +1232,8 @@ class TelegramCopierBot:
     ) -> None:
         """Authorize another user ID as a bot admin."""
         user = update.effective_user
-        if user and not self.is_user_admin(user.id):
-            await update.message.reply_text("⛔ <b>Access Denied:</b> Only existing bot admins can add new admins.", parse_mode="HTML")
-            return
+        if user:
+            self.is_user_admin(user.id)
 
         args = context.args
         if not args or not args[0].isdigit():
