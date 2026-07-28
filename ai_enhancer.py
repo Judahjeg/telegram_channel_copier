@@ -5,19 +5,18 @@ import logging
 import os
 import urllib.request
 import urllib.error
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 logger = logging.getLogger("ChannelCopier")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 
-def call_gemini_api(prompt_text: str, timeout_sec: int = 10) -> Optional[str]:
+def call_gemini_api(prompt_text: str, timeout_sec: int = 12) -> Optional[str]:
     """Helper to call Gemini API with fallback across model endpoints."""
     if not GEMINI_API_KEY:
         return None
 
-    # Model endpoints to try in order
     models = ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
     payload = {
         "contents": [
@@ -117,20 +116,22 @@ def enhance_text_with_gemini(
 def answer_student_question(
     question: str, subject_name: str, class_context_texts: List[str]
 ) -> str:
-    """Answer student questions in Discussion Groups primarily using recent class lesson context."""
+    """Answer student questions in Discussion Groups using class notes if relevant, or general knowledge."""
     context_block = ""
     if class_context_texts:
         formatted_notes = "\n---\n".join(class_context_texts)
-        context_block = f"\nRECENT CLASS LESSON NOTES & CONTEXT:\n{formatted_notes}\n"
+        context_block = f"\nCLASS LESSON REFERENCE NOTES:\n{formatted_notes}\n"
 
     prompt_text = (
-        f"You are an encouraging, expert AI Tutor for the subject '{subject_name}'. "
+        f"You are a friendly, highly knowledgeable AI Tutor for '{subject_name}'. "
         "A student asked a question in the class discussion group. "
-        "Answer their question clearly, concisely, and accurately. "
-        "Primarily base your answer on the class lesson notes provided below when relevant:\n"
+        "Answer their question clearly, accurately, and naturally. "
+        "Use the class notes below as a helpful reference if relevant, but if the answer is not in the notes, "
+        "feel free to use your full general academic knowledge to provide a complete and accurate answer. "
+        "Do NOT mention phrases like 'from today's lesson' or 'according to the notes' unless natural.\n"
         f"{context_block}\n"
         f"STUDENT QUESTION:\n{question}\n\n"
-        "Provide a helpful tutor response tailored to a student:"
+        "Provide a helpful tutor response for the student:"
     )
 
     answer = call_gemini_api(prompt_text, timeout_sec=12)
@@ -138,4 +139,36 @@ def answer_student_question(
         logger.info(f"[AI Q&A] Answered student question for {subject_name}.")
         return answer
 
-    return f"🎓 <b>{subject_name} Tutor</b>: Thank you for your question! Let me review the lesson notes and get back to you shortly."
+    return f"🎓 <b>{subject_name} Tutor</b>: Thank you for your question! Here is a helpful answer to your question."
+
+
+def process_admin_conversational_assistant(
+    user_message: str, class_pairs_summary: str, is_admin: bool
+) -> str:
+    """Conversational AI Assistant that helps administrators configure and manage the bot via natural language."""
+    if not is_admin:
+        return "⛔ <b>Access Denied:</b> Only authorized bot administrators can manage bot settings."
+
+    prompt_text = (
+        "You are an intelligent, friendly AI Manager Assistant for the 'Iconic Impact Tutor' Telegram Bot. "
+        "The user is managing their channel copier bot via natural language. "
+        "Available Classes & Config:\n"
+        f"{class_pairs_summary}\n\n"
+        "If the user wants to perform a bot action, respond by starting your message with one of these ACTION intent codes, followed by a friendly explanation:\n"
+        "- `ACTION:SETDELAY|<Class_Name>|<Seconds>` (e.g. `ACTION:SETDELAY|Chemistry 1|180`)\n"
+        "- `ACTION:PROMPT|<Class_Name>|<Custom_Instruction>` (e.g. `ACTION:PROMPT|Biology 1|Keep sentences simple`)\n"
+        "- `ACTION:ACTIVATE|<Class_Name>` (e.g. `ACTION:ACTIVATE|Physics`)\n"
+        "- `ACTION:HELP` (General assistance)\n"
+        "If the user is asking a general question about how to use the bot, explain clearly in simple English.\n\n"
+        f"USER MESSAGE: {user_message}\n\n"
+        "RESPONSE:"
+    )
+
+    result = call_gemini_api(prompt_text, timeout_sec=12)
+    if result:
+        return result
+
+    return (
+        "🤖 <b>AI Assistant</b>: I am here to help you manage your bot! "
+        "You can tell me things like <i>'Set Chemistry 1 delay to 3 minutes'</i> or <i>'Make Biology posts simple'</i>."
+    )
