@@ -116,7 +116,7 @@ def call_ai_api(prompt_text: str, timeout_sec: int = 15) -> Optional[str]:
 def enhance_text_with_gemini(
     text: str, subject_name: str, mode: str = "flow", custom_instruction: Optional[str] = None
 ) -> str:
-    """Enhance educational post text using AI and attach high-impact Exam Tips."""
+    """Enhance educational post text using AI according to mode or custom user instructions."""
     if not text or not text.strip() or mode == "off":
         return text
 
@@ -128,31 +128,31 @@ def enhance_text_with_gemini(
             f"Follow these custom user instructions to edit the post text below:\n"
             f"USER INSTRUCTION: {custom_instruction}\n\n"
             f"ORIGINAL POST TEXT:\n{text}\n\n"
-            "Output the final edited post text, and append a short '💡 Key Exam Tip' at the very bottom:"
+            "Output ONLY the final edited post text:"
         )
     else:
         prompts = {
             "flow": (
                 f"You are an expert tutor for {clean_name}. "
                 "Polish the following lesson post to make sentences flow smoothly, format key terms in bold, and improve readability. "
-                "DO NOT change facts or formulas. At the bottom, add a 1-sentence '💡 Key Exam Tip:' relevant to the lesson.\n\n"
+                "DO NOT change facts, formulas, or add extra commentary. Output ONLY the polished text:\n\n"
                 f"{text}"
             ),
             "polish": (
                 f"You are an expert tutor for {clean_name}. "
                 "Polish the following lesson post to make sentences flow smoothly, format key terms in bold, and improve readability. "
-                "At the bottom, add a 1-sentence '💡 Key Exam Tip:' relevant to the lesson.\n\n"
+                "Output ONLY the polished text:\n\n"
                 f"{text}"
             ),
             "paraphrase": (
                 f"You are a master tutor for {clean_name}. "
                 "Rewrite the following lesson post to make it highly engaging and clear for students. "
-                "Preserve all facts and formulas. Append a '💡 Iconic Exam Tip:' box at the bottom:\n\n"
+                "Preserve all facts and formulas. Output ONLY the rewritten post:\n\n"
                 f"{text}"
             ),
             "summarize": (
                 f"You are a study guide generator for {clean_name}. "
-                "Summarize the following post into bullet points. Include a '🔑 Core Takeaway:' box at the bottom:\n\n"
+                "Summarize the following post into bullet points. Output ONLY the summary:\n\n"
                 f"{text}"
             ),
             "hashtags": (
@@ -167,7 +167,7 @@ def enhance_text_with_gemini(
 
     result = call_ai_api(prompt_text)
     if result:
-        logger.info(f"[AI Enhancer] Enhanced post with Exam Tip for {clean_name}.")
+        logger.info(f"[AI Enhancer] Enhanced post for {clean_name}.")
         return result
 
     return text
@@ -218,7 +218,6 @@ def generate_class_quiz(subject_name: str, class_context_texts: List[str]) -> Op
     res = call_ai_api(prompt_text, timeout_sec=15)
     if res:
         try:
-            # Clean possible markdown block
             clean_json = res.replace("```json", "").replace("```", "").strip()
             data = json.loads(clean_json)
             if "question" in data and "options" in data and "correct_option_id" in data:
