@@ -1479,27 +1479,52 @@ class TelegramCopierBot:
             self.is_user_admin(user.id)
 
         args = context.args
-        if not args or len(args) < 2:
-            await update.message.reply_text(
-                "🧪 <b>Test quiz recovery on one message:</b>\n\n"
-                "Syntax: <code>/testquiz channel_id message_id</code>\n"
-                "Example: <code>/testquiz -1001234567890 545</code>\n\n"
-                "Reads that message and shows exactly what would be recovered - question, options, "
-                "and correct answer - without posting anything. Use this to confirm quiz recovery "
-                "works on your real content before running a full migration.",
-                parse_mode="HTML",
-            )
+        usage = (
+            "🧪 <b>Test quiz recovery on one message:</b>\n\n"
+            "Easiest way — just paste the message's <b>Copy Message Link</b> straight from Telegram:\n"
+            "<code>/testquiz https://t.me/c/1234567890/545</code>\n\n"
+            "Or give the channel ID and message ID directly:\n"
+            "<code>/testquiz channel_id message_id</code>\n"
+            "Example: <code>/testquiz -1001234567890 545</code>\n\n"
+            "Reads that message and shows exactly what would be recovered - question, options, "
+            "and correct answer - without posting anything. Use this to confirm quiz recovery "
+            "works on your real content before running a full migration."
+        )
+
+        if not args:
+            await update.message.reply_text(usage, parse_mode="HTML")
             return
 
         if not await ub.is_logged_in():
             await update.message.reply_text("❌ Not connected yet. Run <code>/userbotlogin +yourphone</code> first.", parse_mode="HTML")
             return
 
-        try:
-            channel_id = int(args[0])
-            message_id = int(args[1])
-        except ValueError:
-            await update.message.reply_text("❌ channel_id and message_id must both be numbers.", parse_mode="HTML")
+        channel_id: Optional[int] = None
+        message_id: Optional[int] = None
+
+        if len(args) == 1:
+            try:
+                resolved = await self._resolve_message_link(args[0], context)
+            except ValueError as e:
+                await update.message.reply_text(f"❌ {e}")
+                return
+            if resolved:
+                channel_id, message_id, _title = resolved
+
+        if channel_id is None or message_id is None:
+            if len(args) >= 2:
+                try:
+                    channel_id = int(args[0])
+                    message_id = int(args[1])
+                except ValueError:
+                    channel_id = None
+
+        if channel_id is None or message_id is None:
+            await update.message.reply_text(
+                "❌ Couldn't understand that. Paste a message link, or give "
+                "<code>channel_id message_id</code> as plain numbers.\n\n" + usage,
+                parse_mode="HTML",
+            )
             return
 
         await update.message.reply_text("🔍 Reading and testing recovery on that message...")
@@ -1886,18 +1911,14 @@ class TelegramCopierBot:
         r"(?:https?://)?t\.me/(?:c/(?P<internal_id>\d+)|(?P<username>[A-Za-z0-9_]{5,32}))/(?P<msg_id>\d+)"
     )
 
-    async def handle_message_link_text(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
-    ) -> bool:
-        """Parses a pasted 'Copy Message Link' (e.g. https://t.me/c/1234567890/1500) directly -
-        the simplest option, since long-press -> Copy Message Link is something people already
-        know how to do, and the link alone already carries both the channel and message ID.
-        Returns True if the text was a message link and has been handled."""
-        message = update.effective_message
-        user = update.effective_user
-        match = self.TG_MESSAGE_LINK_RE.search(message.text or "")
+    async def _resolve_message_link(self, link_text: str, context: ContextTypes.DEFAULT_TYPE):
+        """Parses a pasted 'Copy Message Link' (e.g. https://t.me/c/1234567890/1500 or
+        https://t.me/somepublicchannel/1500) into (chat_id, msg_id, title). Returns None if the
+        text doesn't contain a recognizable link. Raises ValueError if a public @username link
+        can't be resolved (bot not a member of that channel)."""
+        match = self.TG_MESSAGE_LINK_RE.search(link_text or "")
         if not match:
-            return False
+            return None
 
         msg_id = int(match.group("msg_id"))
         if match.group("internal_id"):
@@ -1916,11 +1937,31 @@ class TelegramCopierBot:
                 chat_id = chat.id
                 title = chat.title or username
             except Exception as e:
-                await message.reply_text(
-                    f"❌ Couldn't look up @{username} - make sure the bot is added to that channel as an admin. ({e})"
+                raise ValueError(
+                    f"Couldn't look up @{username} - make sure the bot is added to that channel as an admin. ({e})"
                 )
-                return True
 
+        return chat_id, msg_id, title
+
+    async def handle_message_link_text(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> bool:
+        """Parses a pasted 'Copy Message Link' directly - the simplest option, since long-press
+        -> Copy Message Link is something people already know how to do, and the link alone
+        already carries both the channel and message ID. Returns True if the text was a message
+        link and has been handled (as a migration reference - see _ingest_migration_ref)."""
+        message = update.effective_message
+        user = update.effective_user
+
+        try:
+            resolved = await self._resolve_message_link(message.text or "", context)
+        except ValueError as e:
+            await message.reply_text(f"❌ {e}")
+            return True
+        if not resolved:
+            return False
+
+        chat_id, msg_id, title = resolved
         reply = await self._ingest_migration_ref(user.id, chat_id, title, msg_id)
         await message.reply_text(reply, parse_mode="HTML")
         return True

@@ -246,10 +246,12 @@ the destination with the same content. Without a connected account, quiz polls a
 reported clearly in the completion message, with a suggestion to use `/quiz ClassName` to
 generate a new AI practice quiz instead (not the original, but a working substitute).
 
-**Test it on one real quiz before trusting it across a whole migration:**
+**Test it on one real quiz before trusting it across a whole migration** — just paste the
+message's **Copy Message Link** straight from Telegram:
 ```
-/testquiz channel_id message_id
+/testquiz https://t.me/c/1234567890/545
 ```
+or give the channel ID and message ID directly: `/testquiz channel_id message_id`.
 Reads that specific message and shows exactly what would be recovered — question, options, and
 correct answer marked — without posting anything anywhere. If it looks right, the same mechanism
 is used automatically by every migration path. Completion messages for `/backfill`,
