@@ -7,17 +7,42 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 from telethon.tl.types import Channel, Chat, User, MessageMediaPoll, UpdateMessagePoll
 from telethon.tl.functions.messages import SendVoteRequest
 
-SESSION_NAME = os.getenv("USERBOT_SESSION_NAME", "migration_userbot")
+SESSION_STRING_ENV = "USERBOT_SESSION_STRING"
+# Local convenience cache for CLI/terminal use on a real persistent machine, where a plain
+# file "just working" across separate script invocations is fine. This is NOT what makes
+# things durable on Render - a host without a persistent disk wipes this file on every
+# redeploy just like it would any other local file, which is exactly why the environment
+# variable is the real, durable mechanism there.
+LOCAL_SESSION_CACHE_FILE = os.getenv("USERBOT_SESSION_FILE", ".userbot_session_string")
+
+
+def _load_session_string() -> str:
+    env_value = os.getenv(SESSION_STRING_ENV, "")
+    if env_value:
+        return env_value
+    if os.path.exists(LOCAL_SESSION_CACHE_FILE):
+        try:
+            with open(LOCAL_SESSION_CACHE_FILE) as f:
+                return f.read().strip()
+        except Exception:
+            pass
+    return ""
 
 
 def get_client() -> TelegramClient:
     """Build a Telethon client from TELEGRAM_API_ID / TELEGRAM_API_HASH.
     Get these once (free) from https://my.telegram.org -> API Development Tools.
-    The session file (SESSION_NAME.session) persists the login after the first
-    successful sign-in, so this only needs to happen once per machine."""
+
+    Uses a StringSession (portable text, not Telethon's native binary/sqlite session file)
+    so login can survive on hosts without a persistent disk (e.g. Render's free tier) via the
+    USERBOT_SESSION_STRING environment variable - a local file there gets wiped on every
+    redeploy, silently forcing a fresh login each time. For local/CLI use, the string is also
+    cached in a local file so repeated script runs on the same machine "just work" without
+    manually managing an environment variable."""
     api_id = os.getenv("TELEGRAM_API_ID")
     api_hash = os.getenv("TELEGRAM_API_HASH")
     if not api_id or not api_hash:
@@ -25,7 +50,7 @@ def get_client() -> TelegramClient:
             "TELEGRAM_API_ID and TELEGRAM_API_HASH environment variables are required. "
             "Get them for free from https://my.telegram.org -> 'API Development Tools'."
         )
-    return TelegramClient(SESSION_NAME, int(api_id), api_hash)
+    return TelegramClient(StringSession(_load_session_string()), int(api_id), api_hash)
 
 
 async def request_login_code(phone: str) -> str:
@@ -40,8 +65,11 @@ async def request_login_code(phone: str) -> str:
         await client.disconnect()
 
 
-async def complete_login(phone: str, code: str, phone_code_hash: str, password: Optional[str] = None) -> str:
-    """Step 2 of login: verifies the code (and 2FA password if enabled) and persists the session."""
+async def complete_login(phone: str, code: str, phone_code_hash: str, password: Optional[str] = None) -> Dict[str, str]:
+    """Step 2 of login: verifies the code (and 2FA password if enabled) and returns both a
+    greeting and the resulting session string, which the caller must show to the admin so they
+    can save it as USERBOT_SESSION_STRING - without that, the login only lasts until this
+    process restarts."""
     client = get_client()
     await client.connect()
     try:
@@ -53,7 +81,16 @@ async def complete_login(phone: str, code: str, phone_code_hash: str, password: 
             else:
                 raise
         me = await client.get_me()
-        return f"Logged in as {me.first_name} (@{me.username or me.id})"
+        session_string = client.session.save()
+        try:
+            with open(LOCAL_SESSION_CACHE_FILE, "w") as f:
+                f.write(session_string)
+        except Exception:
+            pass
+        return {
+            "greeting": f"Logged in as {me.first_name} (@{me.username or me.id})",
+            "session_string": session_string,
+        }
     finally:
         await client.disconnect()
 

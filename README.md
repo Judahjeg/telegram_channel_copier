@@ -200,11 +200,25 @@ Create or edit `config.json` in the root folder. You can configure as many pairs
 
 ## 📊 Database & Resuming State
 
-The bot uses an SQLite database `copier.db` stored in the working directory. It automatically records progress:
+By default the bot uses a local SQLite database (`copier.db`) in the working directory, which
+automatically records progress: `last_processed_id` per pair, message ID mappings, custom
+prompts, class notes, auto-delivery schedules and their cursors — everything. Restart the bot
+and it picks up exactly where it left off, ignoring anything with `message_id <= last_processed_id`
+so there are zero duplicate or skipped posts.
 
-- When restarted, the bot reads `last_processed_id` from `copier.db`.
-- It ignores any incoming update with `message_id <= last_processed_id`.
-- This guarantees zero duplicate posts and zero skipped posts upon restart.
+**The catch:** on a host without a persistent disk (Render's free tier included), that local
+file gets wiped on every redeploy — silently resetting every class, schedule, and all migration
+progress back to empty. If that's your setup, set a `DATABASE_URL` environment variable pointing
+at a free external Postgres database (e.g. [Neon](https://neon.tech) — no credit card, free
+forever, auto-resumes from idle in about a second) and the bot uses that instead automatically;
+nothing else changes. Get a free database in about a minute (sign up → create a project → copy
+the connection string it gives you) and set it as `DATABASE_URL` on your server, same place as
+`BOT_TOKEN`.
+
+*(Why Neon over Supabase: Supabase's free tier pauses a project entirely after a week of no
+activity and needs a manual "resume" click in its dashboard — a real risk for a bot that might
+go quiet between semesters. Neon auto-suspends after 5 minutes idle and wakes itself back up in
+about a second, with no action needed from you.)*
 
 ---
 
@@ -302,7 +316,11 @@ your own bot:
    can't happen inside a Telegram message at all: Telegram automatically invalidates a login code
    the instant it detects that code being typed into *any* Telegram chat, even one sent to your own
    bot, so `/userbotverify <code>` as a chat command is a dead end by design on Telegram's part.
-   The web page is what makes this actually work.
+   The web page is what makes this actually work. The success page shows a **session string** —
+   copy it and save it as the `USERBOT_SESSION_STRING` environment variable on your server (same
+   place as `BOT_TOKEN`). Without this, the login only lasts until the process restarts — on hosts
+   without a persistent disk (Render's free tier included), that means every redeploy. Treat this
+   string like a password; never commit it anywhere.
 3. `/mychannels` — lists every channel/group you're in with its exact chat ID.
 4. `/analyzechannel <chat_id>` — message/media volume and how many class "sessions" (contiguous
    bursts separated by big gaps, like overnight) got detected.
@@ -312,9 +330,6 @@ your own bot:
    channel using its *real* original pacing (bursts and pauses, not a uniform fake delay), capped
    so no single real-life pause stalls the whole replay. Posting still goes through the bot's own
    `copy_message`, so media stays intact with no re-upload. Interrupted runs are resume-safe.
-
-This creates a `migration_userbot.session` file on the server the first time you log in — **treat
-it like a password**, it grants full access to your Telegram account. Never commit it.
 
 ### Option B: `migrate_cli.py` from a terminal
 

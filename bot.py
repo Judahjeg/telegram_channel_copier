@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+from html import escape as html_escape
 import http.server
 import json
 import logging
@@ -118,8 +119,8 @@ def start_dummy_web_server():
                 return
 
             if not code:
-                html = VERIFY_FORM_HTML.format(token=token, message="")
-                self.wfile.write(html.encode("utf-8"))
+                page_html = VERIFY_FORM_HTML.format(token=token, message="")
+                self.wfile.write(page_html.encode("utf-8"))
                 return
 
             try:
@@ -127,10 +128,23 @@ def start_dummy_web_server():
                     ub.complete_login(state["phone"], code, state["phone_code_hash"], password=password)
                 )
                 os.remove(USERBOT_LOGIN_STATE_FILE)
-                self.wfile.write(f"<h2>&#9989; {result}</h2><p>You can close this page and go back to Telegram.</p>".encode("utf-8"))
+                greeting = html_escape(result["greeting"])
+                session_string = html_escape(result["session_string"])
+                self.wfile.write(
+                    (
+                        f"<h2>&#9989; {greeting}</h2>"
+                        f"<p><b>One more step</b> to keep this working after the server restarts or "
+                        f"redeploys: copy the text below and save it as the "
+                        f"<code>USERBOT_SESSION_STRING</code> environment variable on your server "
+                        f"(same place as BOT_TOKEN). Treat it like a password.</p>"
+                        f"<textarea readonly style='width:100%;height:100px;font-family:monospace;' "
+                        f"onclick='this.select()'>{session_string}</textarea>"
+                        f"<p>You can close this page and go back to Telegram once that's saved.</p>"
+                    ).encode("utf-8")
+                )
             except Exception as e:
-                html = VERIFY_FORM_HTML.format(token=token, message=f"<p style='color:red'>Failed: {e}. Try again below.</p>")
-                self.wfile.write(html.encode("utf-8"))
+                page_html = VERIFY_FORM_HTML.format(token=token, message=f"<p style='color:red'>Failed: {html_escape(str(e))}. Try again below.</p>")
+                self.wfile.write(page_html.encode("utf-8"))
 
         def log_message(self, format, *args):
             pass

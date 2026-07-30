@@ -48,7 +48,13 @@ async def cmd_login_verify(args) -> None:
         phone, phone_code_hash = f.read().splitlines()
     result = await ub.complete_login(phone, args.code, phone_code_hash, password=args.password)
     os.remove(LOGIN_STATE_FILE)
-    print(result)
+    print(result["greeting"])
+    print(
+        f"\nSession cached locally in {ub.LOCAL_SESSION_CACHE_FILE} - future runs on this "
+        f"machine will pick it up automatically. To use this same login on another host "
+        f"(e.g. the server running bot.py), set it there as the USERBOT_SESSION_STRING "
+        f"environment variable:\n{result['session_string']}"
+    )
 
 
 async def cmd_list_channels(args) -> None:

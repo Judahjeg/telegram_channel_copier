@@ -14,3 +14,7 @@ venv/
 # Secret files & environment
 .env
 run_bot.sh
+*.session
+*.session-journal
+.login_state
+.userbot_session_string
