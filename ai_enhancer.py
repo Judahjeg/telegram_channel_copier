@@ -447,3 +447,29 @@ def process_admin_conversational_assistant(
         "🧙‍♂️ <b>AI Manager Co-Pilot</b>: I am here to help you set up and manage your classes! "
         "Tell me what class you'd like to add or remove, or use `/addclass ClassName source_id dest_id discussion_id`."
     )
+
+
+def convert_local_time_to_utc(freeform_text: str) -> Optional[str]:
+    """Converts a free-form local time + timezone description (e.g. '4pm WAT', '16:00 GMT+1',
+    '10am Lagos time') into a strict 24-hour UTC HH:MM string, so the admin can give a schedule
+    time the way they'd naturally say it instead of pre-converting to UTC themselves."""
+    prompt_text = (
+        "Convert the following into a single 24-hour UTC time, format exactly HH:MM, nothing else "
+        "in your response. If a timezone or city/region is mentioned, convert that local time to "
+        "UTC. If no timezone is mentioned at all, assume the given time is already UTC. If you "
+        "cannot determine one specific time, respond with exactly: UNKNOWN\n\n"
+        f"INPUT: {freeform_text}\n\n"
+        "OUTPUT:"
+    )
+    result = call_ai_api(prompt_text, timeout_sec=12)
+    if not result:
+        return None
+
+    cleaned = result.strip().splitlines()[0].strip()
+    if cleaned.upper() == "UNKNOWN":
+        return None
+
+    match = re.search(r'([01]?\d|2[0-3]):([0-5]\d)', cleaned)
+    if not match:
+        return None
+    return f"{int(match.group(1)):02d}:{match.group(2)}"

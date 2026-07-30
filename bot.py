@@ -290,6 +290,8 @@ class TelegramCopierBot:
         # Per-admin in-progress migration built from forwarded messages instead of
         # manually-typed chat IDs/message IDs - see handle_forwarded_reference.
         self.pending_migration_refs: Dict[int, Dict[str, Any]] = {}
+        # Per-admin in-progress /autodeliver setup wizard - see _handle_schedule_wizard_reply.
+        self.pending_schedule_wizard: Dict[int, Dict[str, Any]] = {}
         # pair_names with a scheduled weekly session currently delivering, so the
         # scheduler loop doesn't start a second overlapping run for the same pool.
         self._running_pool_sessions: Set[str] = set()
@@ -1877,7 +1879,8 @@ class TelegramCopierBot:
                 f"📤 FROM: <b>{refs['source']['title']}</b> (<code>{refs['source']['chat_id']}</code>)\n"
                 f"📥 TO: <b>{title}</b> (<code>{chat_id}</code>)\n"
                 f"Range: messages #{start}–{end}\n\n"
-                f"Reply <b>yes</b> to start migrating, or send a different message to start over."
+                f"Reply <b>yes</b> to migrate this right now, <b>schedule</b> to set up a recurring "
+                f"weekly delivery instead, or send a different message to start over."
             )
 
         self.pending_migration_refs[user_id] = {"source": {"chat_id": chat_id, "title": title}, "start_id": msg_id}
@@ -1885,6 +1888,129 @@ class TelegramCopierBot:
             f"🔄 Starting a fresh migration reference: <b>{title}</b>, message #{msg_id}. "
             f"Send the LAST message from this channel next."
         )
+
+    @staticmethod
+    def _parse_duration_minutes(text: str) -> Optional[int]:
+        """Accepts plain minutes ('120'), hours ('2 hours', '2h', '1.5h'), or minutes spelled out
+        ('90 minutes', '90 mins', '90m') - deterministic, no AI call needed for this one."""
+        text = text.strip().lower()
+        try:
+            return int(text)
+        except ValueError:
+            pass
+        m = re.search(r'(\d+(?:\.\d+)?)\s*h', text)
+        if m:
+            return round(float(m.group(1)) * 60)
+        m = re.search(r'(\d+(?:\.\d+)?)\s*m', text)
+        if m:
+            return round(float(m.group(1)))
+        return None
+
+    async def _handle_schedule_wizard_reply(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str
+    ) -> None:
+        """Guided, step-by-step setup for a weekly auto-delivery schedule: asks for days, then
+        time+timezone (converted to UTC via AI), then session length, then a label - explicitly
+        confirming everything understood before anything gets scheduled."""
+        message = update.effective_message
+        wiz = self.pending_schedule_wizard.get(user_id)
+        if not wiz:
+            return
+        text = text.strip()
+        step = wiz["step"]
+
+        if step == "days":
+            if text.lower() in ("every day", "everyday", "daily", "all", "all week"):
+                days = list(range(7))
+            else:
+                tokens = [d.strip().lower() for d in text.split(",") if d.strip()]
+                days = sorted({WEEKDAY_MAP[d] for d in tokens if d in WEEKDAY_MAP})
+            if not days:
+                await message.reply_text(
+                    "❌ I didn't recognize those days. Try e.g. <code>Mon,Wed,Fri</code> or 'every day'.",
+                    parse_mode="HTML",
+                )
+                return
+            wiz["days"] = days
+            wiz["step"] = "time"
+            await message.reply_text(
+                "🕐 What time should each session start, and what timezone are you in?\n"
+                "e.g. <i>'4pm WAT'</i>, <i>'16:00 GMT+1'</i>, <i>'10am Lagos time'</i>",
+                parse_mode="HTML",
+            )
+            return
+
+        if step == "time":
+            utc_time = ai_enhancer.convert_local_time_to_utc(text)
+            if not utc_time:
+                await message.reply_text(
+                    "❌ I couldn't pin down a specific time from that. Try again, e.g. <i>'4pm WAT'</i> "
+                    "or <i>'16:00 UTC'</i>.",
+                    parse_mode="HTML",
+                )
+                return
+            wiz["start_time"] = utc_time
+            wiz["local_time_text"] = text
+            wiz["step"] = "duration"
+            await message.reply_text(
+                f"✅ Got it — that's <b>{utc_time} UTC</b>.\n\n"
+                f"How long should each session run? e.g. <code>120</code> or <i>'2 hours'</i>",
+                parse_mode="HTML",
+            )
+            return
+
+        if step == "duration":
+            duration = self._parse_duration_minutes(text)
+            if not duration:
+                await message.reply_text(
+                    "❌ Couldn't read that as a duration. Try e.g. <code>120</code> or <i>'2 hours'</i>.",
+                    parse_mode="HTML",
+                )
+                return
+            wiz["duration_minutes"] = duration
+            wiz["step"] = "name"
+            await message.reply_text(
+                "📚 What should I call this schedule? (or reply <b>skip</b> for an auto-generated name)",
+                parse_mode="HTML",
+            )
+            return
+
+        if step == "name":
+            wiz["name"] = None if text.lower() == "skip" else text
+            wiz["step"] = "confirm"
+            days_str = ", ".join(WEEKDAY_NAMES[d] for d in wiz["days"])
+            name_display = wiz["name"] or f"autodeliver_{wiz['source']['chat_id']}_{wiz['dest']['chat_id']}"
+            await message.reply_text(
+                f"✅ <b>Here's what I've got — please confirm:</b>\n\n"
+                f"📚 <b>{name_display}</b>\n"
+                f"📤 FROM: <b>{wiz['source']['title']}</b> (<code>{wiz['source']['chat_id']}</code>)\n"
+                f"📥 TO: <b>{wiz['dest']['title']}</b> (<code>{wiz['dest']['chat_id']}</code>)\n"
+                f"Messages: #{wiz['start_id']}–{wiz.get('end_id', wiz['start_id'])}\n"
+                f"🗓️ Every <b>{days_str}</b>, starting <b>{wiz['start_time']} UTC</b> "
+                f"(from \"{wiz['local_time_text']}\"), for <b>{wiz['duration_minutes']} min</b>\n\n"
+                f"Reply <b>yes</b> to schedule this, or anything else to cancel.",
+                parse_mode="HTML",
+            )
+            return
+
+        if step == "confirm":
+            if text.lower() not in ("yes", "y", "confirm", "go", "yes please"):
+                self.pending_schedule_wizard.pop(user_id, None)
+                await message.reply_text("Cancelled — nothing was scheduled.")
+                return
+
+            days_str = ",".join(WEEKDAY_NAMES[d] for d in wiz["days"])
+            args = [
+                str(wiz["source"]["chat_id"]), str(wiz["dest"]["chat_id"]),
+                str(wiz["start_id"]), str(wiz.get("end_id", wiz["start_id"])),
+                days_str, wiz["start_time"], str(wiz["duration_minutes"]),
+            ]
+            if wiz.get("name"):
+                args.append(wiz["name"])
+            context.args = args
+            self.pending_schedule_wizard.pop(user_id, None)
+            await self.autodeliver_command(update, context)
+            return
 
     async def handle_forwarded_reference(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1988,18 +2114,39 @@ class TelegramCopierBot:
         if chat.type == "private" and message.text and not message.text.startswith("/"):
             user_id = user.id if user else 0
 
+            if user_id in self.pending_schedule_wizard:
+                await self._handle_schedule_wizard_reply(update, context, user_id, message.text)
+                return
+
             if await self.handle_message_link_text(update, context):
                 return
 
             refs = self.pending_migration_refs.get(user_id)
-            if refs and refs.get("ready") and message.text.strip().lower() in ("yes", "y", "confirm", "go", "start", "yes please"):
-                context.args = [
-                    str(refs["source"]["chat_id"]), str(refs["dest"]["chat_id"]),
-                    str(refs["start_id"]), str(refs.get("end_id", refs["start_id"])),
-                ]
-                self.pending_migration_refs.pop(user_id, None)
-                await self.backfill_command(update, context)
-                return
+            if refs and refs.get("ready"):
+                reply_lower = message.text.strip().lower()
+                if reply_lower in ("yes", "y", "confirm", "go", "start", "yes please"):
+                    context.args = [
+                        str(refs["source"]["chat_id"]), str(refs["dest"]["chat_id"]),
+                        str(refs["start_id"]), str(refs.get("end_id", refs["start_id"])),
+                    ]
+                    self.pending_migration_refs.pop(user_id, None)
+                    await self.backfill_command(update, context)
+                    return
+                if reply_lower in ("schedule", "weekly", "recurring", "every week", "auto", "autodeliver"):
+                    self.pending_schedule_wizard[user_id] = {
+                        "step": "days",
+                        "source": refs["source"],
+                        "dest": refs["dest"],
+                        "start_id": refs["start_id"],
+                        "end_id": refs.get("end_id", refs["start_id"]),
+                    }
+                    self.pending_migration_refs.pop(user_id, None)
+                    await message.reply_text(
+                        "🗓️ <b>Let's set up a weekly schedule.</b>\n\n"
+                        "Which days should this run? e.g. <code>Mon,Wed,Fri</code> or 'every day'",
+                        parse_mode="HTML",
+                    )
+                    return
 
             await self.handle_admin_conversational_chat(update, context)
             return
@@ -2099,7 +2246,9 @@ class TelegramCopierBot:
             "Link</b> → paste that link to me right here.\n"
             "2. Do the same for the LAST message you want migrated.\n"
             "3. Send me one message/link from the NEW channel.\n"
-            "4. I'll show you what I understood — reply <b>yes</b> and I'll run it.\n\n"
+            "4. I'll show you what I understood — reply <b>yes</b> to run it now, or <b>schedule</b> "
+            "to set it up as a recurring weekly delivery instead (I'll ask the days/time/duration "
+            "step by step).\n\n"
             "That's it — no chat IDs to look up, no setup required first.\n\n"
             "💬 Or just tell me what you want in plain English, e.g. <i>\"add a class called Further "
             "Maths from source -100123 to dest -100456\"</i>.\n\n"
@@ -2309,12 +2458,15 @@ class TelegramCopierBot:
             "<i>(Prefer typing exact numbers? <code>/backfill source_id dest_id start_id end_id</code> "
             "works too, or <code>/backfill ClassName start_id end_id</code> for an already-registered class.)</i>\n\n"
             "<b>2c. Auto-Deliver On a Weekly Schedule (no manual triggering):</b>\n"
-            "<code>/autodeliver source_id dest_id start_id end_id days start_time duration_minutes [Name]</code>\n"
-            "Example: <code>/autodeliver -100111 -100222 1 850 Mon,Wed,Fri 15:00 120 Physics</code>\n"
-            "Delivers that message range automatically every Mon/Wed/Fri, starting 15:00 UTC, spread "
-            "2-5 min apart across a 120-minute window - picking up where it left off each session "
-            "until fully delivered. No need to run anything yourself when class time comes around. "
-            "Use <code>/stopautodeliver</code> to view or cancel schedules.\n\n"
+            "After pasting the 3 links/forwards above, reply <b>schedule</b> instead of <b>yes</b> and "
+            "I'll ask you the rest step by step: which days, what time (in your own words - e.g. "
+            "<i>'4pm WAT'</i>, I'll convert it), how long each session should run, and what to call it - "
+            "then show you exactly what I understood before setting anything up.\n"
+            "<i>(Prefer one command? <code>/autodeliver source_id dest_id start_id end_id days start_time "
+            "duration_minutes [Name]</code>, e.g. <code>/autodeliver -100111 -100222 1 850 Mon,Wed,Fri 15:00 "
+            "120 Physics</code> - note this form needs the time already in UTC.)</i> Delivers that message "
+            "range automatically, spread 2-5 min apart across the session window, picking up where it left "
+            "off each time until fully delivered. Use <code>/stopautodeliver</code> to view or cancel schedules.\n\n"
             "<b>2d. Replay Old Classes With Their Real Timing (advanced):</b>\n"
             "1. <code>/userbotlogin +yourphone</code> then open the web link it gives you to enter the "
             "code (never type the code into Telegram itself - it gets auto-blocked). One-time, needs "
