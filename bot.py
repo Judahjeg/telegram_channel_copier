@@ -494,6 +494,7 @@ class TelegramCopierBot:
         skipped_polls = 0
         recreated_quizzes = 0
         skip_samples: List[str] = []
+        recreated_samples: List[str] = []
 
         try:
             try:
@@ -510,12 +511,14 @@ class TelegramCopierBot:
                     break
 
                 try:
-                    result, recreated = await self._copy_or_recover_quiz(application, source_id, dest_id, cursor_id)
+                    result, recreated, quiz_q = await self._copy_or_recover_quiz(application, source_id, dest_id, cursor_id)
                     if result:
                         db.save_message_mapping(pair_name, cursor_id, result.message_id)
                         delivered += 1
                         if recreated:
                             recreated_quizzes += 1
+                            if len(recreated_samples) < 5:
+                                recreated_samples.append(f"#{cursor_id}: {quiz_q[:70]}")
                 except BadRequest as e:
                     if self._is_poll_copy_restriction(e):
                         skipped_polls += 1
@@ -551,11 +554,12 @@ class TelegramCopierBot:
                     f"created a quiz copy it, and the answer couldn't be recovered; use /quiz to "
                     f"generate fresh ones.)"
                 )
+            recreated_note = f"\n\n<b>Recovered:</b>\n<code>{chr(10).join(recreated_samples)}</code>" if recreated_samples else ""
             samples_note = f"\n\n<code>{chr(10).join(skip_samples)}</code>" if skip_samples else ""
             try:
                 await application.bot.send_message(
                     notify_chat_id,
-                    f"✅ <b>{pair_name}:</b> today's session delivered {delivered} message(s).{done_note}{poll_note}{samples_note}",
+                    f"✅ <b>{pair_name}:</b> today's session delivered {delivered} message(s).{done_note}{poll_note}{recreated_note}{samples_note}",
                     parse_mode="HTML",
                 )
             except Exception:
@@ -575,8 +579,10 @@ class TelegramCopierBot:
         """Copies a message; if it's a quiz poll Telegram refuses to copy (the original-creator
         restriction), tries to recover the real question/options/correct-answer via the connected
         userbot account and recreate it as a fresh quiz instead of losing it outright. Returns
-        (result, recreated) - recreated=True means the quiz-recovery path was used. Re-raises the
-        original error if recovery isn't possible (not logged in, or the answer can't be read)."""
+        (result, recreated, question) - recreated=True means the quiz-recovery path was used, and
+        question is the recovered text (for the caller to surface, so recovered quizzes are
+        spot-checkable rather than just a bare count). Re-raises the original error if recovery
+        isn't possible (not logged in, or the answer can't be read)."""
         try:
             result = await self._call_with_retry(
                 application.bot.copy_message,
@@ -584,7 +590,7 @@ class TelegramCopierBot:
                 from_chat_id=source_id,
                 message_id=msg_id,
             )
-            return result, False
+            return result, False, None
         except BadRequest as e:
             if not self._is_poll_copy_restriction(e) or not await ub.is_logged_in():
                 raise
@@ -604,7 +610,7 @@ class TelegramCopierBot:
                 explanation=(quiz_data.explanation[:195] if quiz_data.explanation else None),
                 is_anonymous=False,
             )
-            return result, True
+            return result, True, quiz_data.question
 
     async def _call_with_retry(self, coro_func, max_attempts: int = 4, **kwargs):
         """Call a Telegram Bot API method, transparently retrying on flood-control (RetryAfter)
@@ -1019,18 +1025,21 @@ class TelegramCopierBot:
         skipped_polls = 0
         recreated_quizzes = 0
         skip_samples: List[str] = []
+        recreated_samples: List[str] = []
         total = end_id - start_id + 1
 
         logger.info(f"[Backfill:{pair_name}] Starting migration of IDs {start_id}-{end_id} ({total} messages).")
 
         for msg_id in range(start_id, end_id + 1):
             try:
-                result, recreated = await self._copy_or_recover_quiz(application, source_id, dest_id, msg_id)
+                result, recreated, quiz_q = await self._copy_or_recover_quiz(application, source_id, dest_id, msg_id)
                 if result:
                     db.save_message_mapping(pair_name, msg_id, result.message_id)
                     copied += 1
                     if recreated:
                         recreated_quizzes += 1
+                        if len(recreated_samples) < 5:
+                            recreated_samples.append(f"#{msg_id}: {quiz_q[:70]}")
             except BadRequest as e:
                 # Expected for gaps: deleted messages, service messages, or IDs that never existed -
                 # plus quiz polls that couldn't be recovered (no userbot connected, or Telegram
@@ -1074,6 +1083,7 @@ class TelegramCopierBot:
                 f"If this channel is registered as a class, use <code>/quiz ClassName</code> to "
                 f"generate a fresh AI practice quiz instead."
             )
+        recreated_note = f"\n\n<b>Recovered:</b>\n<code>{chr(10).join(recreated_samples)}</code>" if recreated_samples else ""
         samples_note = f"\n\n<code>{chr(10).join(skip_samples)}</code>" if skip_samples else ""
 
         try:
@@ -1081,7 +1091,7 @@ class TelegramCopierBot:
                 notify_chat_id,
                 f"🎉 <b>Backfill complete for {pair_name}!</b>\n\n"
                 f"✅ Copied: {copied}\n⏭️ Skipped (not found/deleted/restricted): {skipped}\n❌ Failed: {failed}"
-                f"{poll_note}{samples_note}",
+                f"{poll_note}{recreated_note}{samples_note}",
                 parse_mode="HTML",
             )
         except Exception:
@@ -1458,6 +1468,74 @@ class TelegramCopierBot:
 
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
+    async def testquiz_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Preview exactly what quiz-recovery would produce for one specific poll message -
+        verifies the real question/options/correct-answer are readable before trusting this
+        across a whole migration, without posting anything anywhere."""
+        user = update.effective_user
+        if user:
+            self.is_user_admin(user.id)
+
+        args = context.args
+        if not args or len(args) < 2:
+            await update.message.reply_text(
+                "🧪 <b>Test quiz recovery on one message:</b>\n\n"
+                "Syntax: <code>/testquiz channel_id message_id</code>\n"
+                "Example: <code>/testquiz -1001234567890 545</code>\n\n"
+                "Reads that message and shows exactly what would be recovered - question, options, "
+                "and correct answer - without posting anything. Use this to confirm quiz recovery "
+                "works on your real content before running a full migration.",
+                parse_mode="HTML",
+            )
+            return
+
+        if not await ub.is_logged_in():
+            await update.message.reply_text("❌ Not connected yet. Run <code>/userbotlogin +yourphone</code> first.", parse_mode="HTML")
+            return
+
+        try:
+            channel_id = int(args[0])
+            message_id = int(args[1])
+        except ValueError:
+            await update.message.reply_text("❌ channel_id and message_id must both be numbers.", parse_mode="HTML")
+            return
+
+        await update.message.reply_text("🔍 Reading and testing recovery on that message...")
+
+        try:
+            quiz_data = await ub.get_quiz_poll_data(channel_id, message_id)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error reading message: {e}")
+            return
+
+        if quiz_data is None:
+            await update.message.reply_text(
+                "❌ That message isn't a quiz poll (or couldn't be read at all). "
+                "Double-check the channel ID and message ID.",
+                parse_mode="HTML",
+            )
+            return
+
+        lines = [f"🧠 <b>Quiz Recovery Test — message #{message_id}</b>\n", f"❓ <b>{quiz_data.question}</b>\n"]
+        for i, opt in enumerate(quiz_data.options):
+            marker = "✅" if quiz_data.correct_option_id == i else "▫️"
+            lines.append(f"{marker} {opt}")
+        if quiz_data.explanation:
+            lines.append(f"\n💡 <i>{quiz_data.explanation}</i>")
+
+        if quiz_data.correct_option_id is None:
+            lines.append(
+                "\n\n⚠️ <b>Correct answer not recoverable.</b> This shouldn't normally happen — "
+                "either the vote-to-reveal attempt failed, or the poll has an unusual state. "
+                "This specific quiz would be skipped (not recreated) during a real migration."
+            )
+        else:
+            lines.append("\n\n✅ This is exactly what would be recreated on the destination channel during a real migration.")
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
     async def timedbackfill_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -1536,6 +1614,7 @@ class TelegramCopierBot:
         skipped_polls = 0
         recreated_quizzes = 0
         skip_samples: List[str] = []
+        recreated_samples: List[str] = []
         total = len(session.messages)
 
         logger.info(f"[TimedBackfill:{pair_name}] Starting replay of {total} messages.")
@@ -1551,12 +1630,14 @@ class TelegramCopierBot:
                 continue
 
             try:
-                result, recreated = await self._copy_or_recover_quiz(application, source_id, dest_id, msg.id)
+                result, recreated, quiz_q = await self._copy_or_recover_quiz(application, source_id, dest_id, msg.id)
                 if result:
                     db.save_message_mapping(pair_name, msg.id, result.message_id)
                     copied += 1
                     if recreated:
                         recreated_quizzes += 1
+                        if len(recreated_samples) < 5:
+                            recreated_samples.append(f"#{msg.id}: {quiz_q[:70]}")
             except BadRequest as e:
                 skipped += 1
                 if self._is_poll_copy_restriction(e):
@@ -1589,11 +1670,12 @@ class TelegramCopierBot:
                 f"copy them and the answer couldn't be recovered. "
                 f"Use <code>/quiz ClassName</code> to generate fresh AI practice quizzes instead."
             )
+        recreated_note = f"\n\n<b>Recovered:</b>\n<code>{chr(10).join(recreated_samples)}</code>" if recreated_samples else ""
         samples_note = f"\n\n<code>{chr(10).join(skip_samples)}</code>" if skip_samples else ""
         try:
             await application.bot.send_message(
                 notify_chat_id,
-                f"🎉 <b>Timed replay complete!</b>\n\n✅ Copied: {copied}\n⏭️ Skipped: {skipped}{poll_note}{samples_note}",
+                f"🎉 <b>Timed replay complete!</b>\n\n✅ Copied: {copied}\n⏭️ Skipped: {skipped}{poll_note}{recreated_note}{samples_note}",
                 parse_mode="HTML",
             )
         except Exception:
@@ -2195,7 +2277,9 @@ class TelegramCopierBot:
             "TELEGRAM_API_ID/TELEGRAM_API_HASH set on the server.\n"
             "2. <code>/mychannels</code> to find chat IDs, <code>/analyzechannel id</code> to see detected class sessions.\n"
             "3. <code>/previewtiming id session_index</code> to preview the real rhythm, then "
-            "<code>/timedbackfill source_id dest_id session_index</code> to replay it for real.\n\n"
+            "<code>/timedbackfill source_id dest_id session_index</code> to replay it for real.\n"
+            "4. Quiz polls get automatically recovered with their real question/answer once connected - "
+            "test one first with <code>/testquiz channel_id message_id</code>.\n\n"
             "<b>3. Delete Any Channel Pair:</b>\n"
             "Tell the AI in chat or use <code>/deleteclass ClassName</code>\n\n"
             "<b>4. Wipe All Classes to Start Fresh:</b>\n"
@@ -2493,6 +2577,7 @@ class TelegramCopierBot:
             BotCommand("mychannels", "List your channels with chat IDs"),
             BotCommand("analyzechannel", "Test a channel: volume & detected sessions"),
             BotCommand("previewtiming", "Preview a session's real message timing"),
+            BotCommand("testquiz", "Preview quiz recovery on one message, no posting"),
             BotCommand("timedbackfill", "Replay a session with its real original pacing"),
             BotCommand("pairs", "View explicit FROM ➔ TO channel pairs"),
             BotCommand("deleteclass", "Delete a channel pair"),
@@ -2545,6 +2630,7 @@ class TelegramCopierBot:
         application.add_handler(CommandHandler("mychannels", self.mychannels_command))
         application.add_handler(CommandHandler("analyzechannel", self.analyzechannel_command))
         application.add_handler(CommandHandler("previewtiming", self.previewtiming_command))
+        application.add_handler(CommandHandler("testquiz", self.testquiz_command))
         application.add_handler(CommandHandler("timedbackfill", self.timedbackfill_command))
         application.add_handler(CommandHandler("deleteclass", self.deleteclass_command))
         application.add_handler(CommandHandler("clearallclasses", self.clearallclasses_command))

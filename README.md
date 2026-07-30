@@ -246,6 +246,16 @@ the destination with the same content. Without a connected account, quiz polls a
 reported clearly in the completion message, with a suggestion to use `/quiz ClassName` to
 generate a new AI practice quiz instead (not the original, but a working substitute).
 
+**Test it on one real quiz before trusting it across a whole migration:**
+```
+/testquiz channel_id message_id
+```
+Reads that specific message and shows exactly what would be recovered — question, options, and
+correct answer marked — without posting anything anywhere. If it looks right, the same mechanism
+is used automatically by every migration path. Completion messages for `/backfill`,
+`/autodeliver`, and `/timedbackfill` also list a sample of the actual recovered quiz questions
+(not just a count), so you can spot-check accuracy as migrations run.
+
 ---
 
 ## 🕰️ Migrating Old Channels With Their Real Class Timing
