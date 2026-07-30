@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 
 import db
@@ -33,9 +34,13 @@ def _fmt_dt(dt) -> str:
 
 
 async def cmd_login_request(args) -> None:
-    phone_code_hash = await ub.request_login_code(args.phone)
+    login_start = await ub.request_login_code(args.phone)
     with open(LOGIN_STATE_FILE, "w") as f:
-        f.write(f"{args.phone}\n{phone_code_hash}\n")
+        json.dump({
+            "phone": args.phone,
+            "phone_code_hash": login_start["phone_code_hash"],
+            "session_string": login_start["session_string"],
+        }, f)
     print(f"Code sent to {args.phone}. Check Telegram/SMS, then run:")
     print("  python migrate_cli.py login-verify <the_code> [--password YOUR_2FA_PASSWORD]")
 
@@ -45,8 +50,11 @@ async def cmd_login_verify(args) -> None:
         print("No pending login request found. Run 'login-request <phone>' first.")
         return
     with open(LOGIN_STATE_FILE) as f:
-        phone, phone_code_hash = f.read().splitlines()
-    result = await ub.complete_login(phone, args.code, phone_code_hash, password=args.password)
+        state = json.load(f)
+    result = await ub.complete_login(
+        state["phone"], args.code, state["phone_code_hash"],
+        session_string=state.get("session_string", ""), password=args.password,
+    )
     os.remove(LOGIN_STATE_FILE)
     print(result["greeting"])
     print(

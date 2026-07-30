@@ -125,7 +125,10 @@ def start_dummy_web_server():
 
             try:
                 result = asyncio.run(
-                    ub.complete_login(state["phone"], code, state["phone_code_hash"], password=password)
+                    ub.complete_login(
+                        state["phone"], code, state["phone_code_hash"],
+                        session_string=state.get("session_string", ""), password=password,
+                    )
                 )
                 os.remove(USERBOT_LOGIN_STATE_FILE)
                 greeting = html_escape(result["greeting"])
@@ -1257,10 +1260,15 @@ class TelegramCopierBot:
 
         phone = args[0]
         try:
-            phone_code_hash = await ub.request_login_code(phone)
+            login_start = await ub.request_login_code(phone)
             token = secrets.token_urlsafe(12)
             with open(USERBOT_LOGIN_STATE_FILE, "w") as f:
-                json.dump({"phone": phone, "phone_code_hash": phone_code_hash, "token": token}, f)
+                json.dump({
+                    "phone": phone,
+                    "phone_code_hash": login_start["phone_code_hash"],
+                    "session_string": login_start["session_string"],
+                    "token": token,
+                }, f)
 
             render_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
             if render_url:

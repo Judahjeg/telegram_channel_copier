@@ -33,7 +33,7 @@ def _load_session_string() -> str:
     return ""
 
 
-def get_client() -> TelegramClient:
+def get_client(session_string: Optional[str] = None) -> TelegramClient:
     """Build a Telethon client from TELEGRAM_API_ID / TELEGRAM_API_HASH.
     Get these once (free) from https://my.telegram.org -> API Development Tools.
 
@@ -42,7 +42,10 @@ def get_client() -> TelegramClient:
     USERBOT_SESSION_STRING environment variable - a local file there gets wiped on every
     redeploy, silently forcing a fresh login each time. For local/CLI use, the string is also
     cached in a local file so repeated script runs on the same machine "just work" without
-    manually managing an environment variable."""
+    manually managing an environment variable.
+
+    Pass session_string explicitly to use a specific session (e.g. the partial one captured
+    mid-login by request_login_code) instead of whatever's currently saved/cached."""
     api_id = os.getenv("TELEGRAM_API_ID")
     api_hash = os.getenv("TELEGRAM_API_HASH")
     if not api_id or not api_hash:
@@ -50,27 +53,39 @@ def get_client() -> TelegramClient:
             "TELEGRAM_API_ID and TELEGRAM_API_HASH environment variables are required. "
             "Get them for free from https://my.telegram.org -> 'API Development Tools'."
         )
-    return TelegramClient(StringSession(_load_session_string()), int(api_id), api_hash)
+    if session_string is None:
+        session_string = _load_session_string()
+    return TelegramClient(StringSession(session_string), int(api_id), api_hash)
 
 
-async def request_login_code(phone: str) -> str:
-    """Step 1 of login: sends a Telegram login code to the account and returns a
-    phone_code_hash needed to complete sign-in. Safe to call from a short-lived script."""
-    client = get_client()
+async def request_login_code(phone: str) -> Dict[str, str]:
+    """Step 1 of login: sends a Telegram login code and returns the phone_code_hash needed to
+    complete sign-in, PLUS a partial session string capturing the data center this phone number
+    was resolved to. That partial state must be carried into complete_login() and used to build
+    ITS client - if complete_login instead starts from a totally fresh/empty session, it can
+    land on a different DC than the one that actually issued the code, and Telegram reports that
+    mismatch as a generic 'confirmation code expired' error even when submitted instantly."""
+    client = get_client(session_string="")
     await client.connect()
     try:
         sent = await client.send_code_request(phone)
-        return sent.phone_code_hash
+        return {
+            "phone_code_hash": sent.phone_code_hash,
+            "session_string": client.session.save(),
+        }
     finally:
         await client.disconnect()
 
 
-async def complete_login(phone: str, code: str, phone_code_hash: str, password: Optional[str] = None) -> Dict[str, str]:
+async def complete_login(
+    phone: str, code: str, phone_code_hash: str, session_string: str = "", password: Optional[str] = None
+) -> Dict[str, str]:
     """Step 2 of login: verifies the code (and 2FA password if enabled) and returns both a
     greeting and the resulting session string, which the caller must show to the admin so they
     can save it as USERBOT_SESSION_STRING - without that, the login only lasts until this
-    process restarts."""
-    client = get_client()
+    process restarts. Must be given the partial session_string from request_login_code so this
+    client is on the same data center that actually issued the code."""
+    client = get_client(session_string=session_string)
     await client.connect()
     try:
         try:
