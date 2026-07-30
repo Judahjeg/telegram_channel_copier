@@ -272,3 +272,45 @@ async def get_quiz_poll_data(chat_id: int, msg_id: int) -> Optional[QuizData]:
         )
     finally:
         await client.disconnect()
+
+
+async def describe_message(chat_id: int, msg_id: int) -> str:
+    """Diagnostic helper for when get_quiz_poll_data comes back empty: explains what the
+    referenced message actually is, so a wrong channel/message ID is obvious instead of a
+    bare 'not a quiz' with no way to tell why."""
+    client = get_client()
+    await client.start()
+    try:
+        msg = await client.get_messages(chat_id, ids=msg_id)
+        if isinstance(msg, list):
+            msg = msg[0] if msg else None
+
+        if not msg:
+            return (
+                f"No message with ID {msg_id} was found in chat {chat_id}. Double-check both "
+                f"numbers - a common mistake is copying the ID from the wrong message, or from "
+                f"the wrong channel."
+            )
+
+        if isinstance(msg.media, MessageMediaPoll):
+            poll = msg.media.poll
+            kind = "quiz poll" if poll.quiz else "regular (non-quiz) poll"
+            return f"This IS a poll, but it's a {kind}, not a quiz - question: \"{_text_of(poll.question)}\""
+
+        if msg.text:
+            return f"This is a plain text message, not a poll: \"{msg.text[:120]}\""
+        if msg.photo:
+            cap = f" (caption: \"{msg.text[:100]}\")" if msg.text else ""
+            return f"This is a photo message, not a poll{cap}."
+        if msg.video:
+            cap = f" (caption: \"{msg.text[:100]}\")" if msg.text else ""
+            return f"This is a video message, not a poll{cap}."
+        if msg.document:
+            cap = f" (caption: \"{msg.text[:100]}\")" if msg.text else ""
+            return f"This is a document/file message, not a poll{cap}."
+
+        return "This message exists but isn't a poll of any kind."
+    except Exception as e:
+        return f"Couldn't read that message at all: {e}"
+    finally:
+        await client.disconnect()

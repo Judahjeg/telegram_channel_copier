@@ -1511,9 +1511,12 @@ class TelegramCopierBot:
             return
 
         if quiz_data is None:
+            try:
+                reason = await ub.describe_message(channel_id, message_id)
+            except Exception as e:
+                reason = f"(couldn't get more detail: {e})"
             await update.message.reply_text(
-                "❌ That message isn't a quiz poll (or couldn't be read at all). "
-                "Double-check the channel ID and message ID.",
+                f"❌ That's not readable as a quiz poll.\n\n🔎 <b>What it actually is:</b> {reason}",
                 parse_mode="HTML",
             )
             return
